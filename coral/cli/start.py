@@ -15,7 +15,9 @@ from coral.agent.state import read_agent_state
 from coral.cli._helpers import (
     docker_cmd,
     find_coral_dir,
+    find_coral_dir_and_island,
     find_tmux_session,
+    find_worktree_coral_dir_and_island,
     has_docker,
     has_docker_marker,
     has_tmux,
@@ -529,12 +531,13 @@ def cmd_resume(args: argparse.Namespace) -> None:
 
     task = getattr(args, "task", None)
     run = getattr(args, "run", None)
+    worktree_scope = None if task or run else find_worktree_coral_dir_and_island()
     if task or run or in_docker():
         coral_dir = find_coral_dir(task, run)
-    elif (Path.cwd() / ".coral_dir").exists():
+    elif worktree_scope is not None:
         # Agent in a worktree: lock to the current run via the breadcrumb
         # instead of showing all stopped runs in a picker.
-        coral_dir = find_coral_dir(None, None)
+        coral_dir = worktree_scope[0]
     else:
         coral_dir = pick_run(status_filter="stopped", allow_cancel=True)
     if coral_dir is None:
@@ -707,6 +710,27 @@ def _stop_one(coral_dir: Path) -> None:
         kill_tmux_session(coral_dir)
 
 
+def _current_agent_islands(run_dir: Path) -> dict[str, str]:
+    """Read current island membership from agent worktree breadcrumbs."""
+    agents_dir = run_dir / "agents"
+    if not agents_dir.is_dir():
+        return {}
+    current: dict[str, str] = {}
+    for agent_dir in agents_dir.iterdir():
+        if not agent_dir.is_dir():
+            continue
+        island_file = agent_dir / ".coral_island"
+        if not island_file.exists():
+            continue
+        try:
+            island_id = island_file.read_text().strip()
+        except OSError:
+            continue
+        if island_id:
+            current[agent_dir.name] = island_id
+    return current
+
+
 def cmd_stop(args: argparse.Namespace) -> None:
     """Stop CORAL agents."""
     if getattr(args, "all", False):
@@ -726,12 +750,15 @@ def cmd_stop(args: argparse.Namespace) -> None:
     else:
         task = getattr(args, "task", None)
         run = getattr(args, "run", None)
+        worktree_scope = None if task or run else find_worktree_coral_dir_and_island()
         if task or run:
             coral_dir = find_coral_dir(task, run)
-        elif (Path.cwd() / ".coral_dir").exists() or in_docker():
-            # Agent in a worktree (or Docker run): lock to the current run
-            # via the breadcrumb instead of showing all running runs.
+        elif in_docker():
             coral_dir = find_coral_dir(None, None)
+        elif worktree_scope is not None:
+            # Agent in a worktree: lock to the current run via the breadcrumb
+            # instead of showing all running runs.
+            coral_dir = worktree_scope[0]
         else:
             coral_dir = pick_run(status_filter="running", allow_cancel=True)
         if coral_dir is None:
@@ -745,20 +772,25 @@ def cmd_status(args: argparse.Namespace) -> None:
         format_leaderboard,
         format_status_summary,
         get_leaderboard,
-        per_agent_class_counts,
     )
     from coral.types import BUDGET_CLASS_GRADER_ERROR, BUDGET_CLASS_REAL, BUDGET_CLASS_TUNE
 
     task = getattr(args, "task", None)
     run = getattr(args, "run", None)
+    worktree_scope = None if task or run else find_worktree_coral_dir_and_island()
     if task or run:
         coral_dir = find_coral_dir(task, run)
-    elif (Path.cwd() / ".coral_dir").exists() or in_docker():
-        # Agent in a worktree (or Docker run): lock to the current run
-        # via the .coral_dir breadcrumb instead of showing all runs.
-        coral_dir = find_coral_dir(None, None)
+        island_id = None
+    elif in_docker():
+        coral_dir, island_id = find_coral_dir_and_island()
+    elif worktree_scope is not None:
+        # Agent in a worktree: lock to the current run via the .coral_dir
+        # breadcrumb, scoped to the worktree's island so the leaderboard /
+        # status summary only see that island.
+        coral_dir, island_id = worktree_scope
     else:
         coral_dir = pick_run()
+        island_id = None
 
     real_coral = coral_dir.resolve()
     run_dir = real_coral.parent
@@ -792,74 +824,109 @@ def cmd_status(args: argparse.Namespace) -> None:
         else:
             print("Manager: not running")
 
-    logs_dir = coral_dir / "public" / "logs"
-    if logs_dir.exists():
-        log_files = sorted(logs_dir.glob("*.log"))
-        if log_files:
-            agent_logs: dict[str, list[Path]] = {}
-            for lf in log_files:
-                parts = lf.stem.rsplit(".", 1)
-                agent_name = parts[0] if len(parts) == 2 else lf.stem
-                agent_logs.setdefault(agent_name, []).append(lf)
+    # Agent liveness follows the same scope as attempts/leaderboards. In
+    # multi-island mode logs live in islands/<id>/logs/ — public/logs is
+    # empty — so unscoped operator views aggregate, while worktree views
+    # stay pinned to their island.
+    from coral.hub._island import all_view_roots, island_root
 
-            # Best-effort read of the manager-persisted reliability state.
-            # Missing or corrupt agent_state.json falls back to log inference.
-            agent_state_doc = read_agent_state(coral_dir)
-            agent_states = agent_state_doc.agents
-            class_counts = per_agent_class_counts(coral_dir)
+    log_files: list[Path] = []
+    if island_id is not None or not (coral_dir / "islands").exists():
+        view_roots = [island_root(coral_dir, island_id)]
+    else:
+        view_roots = all_view_roots(coral_dir)
+    for view_root in view_roots:
+        view_logs = view_root / "logs"
+        if view_logs.is_dir():
+            log_files.extend(view_logs.glob("*.log"))
+    if log_files:
+        agent_logs: dict[str, list[Path]] = {}
+        for lf in log_files:
+            parts = lf.stem.rsplit(".", 1)
+            agent_name = parts[0] if len(parts) == 2 else lf.stem
+            agent_logs.setdefault(agent_name, []).append(lf)
+        current_agent_islands = _current_agent_islands(run_dir)
+        if island_id is not None and current_agent_islands:
+            agent_logs = {
+                agent_name: logs
+                for agent_name, logs in agent_logs.items()
+                if current_agent_islands.get(agent_name) == str(island_id)
+            }
 
-            print(f"\nAgents: {len(agent_logs)}")
-            for agent_name, logs in sorted(agent_logs.items()):
-                latest_log = max(logs, key=lambda p: p.stat().st_mtime)
-                log_size = latest_log.stat().st_size
-                mtime = datetime.fromtimestamp(latest_log.stat().st_mtime)
-                age = datetime.now() - mtime
+        # Best-effort read of the manager-persisted reliability state.
+        # Missing or corrupt agent_state.json falls back to log inference.
+        agent_state_doc = read_agent_state(coral_dir)
+        agent_states = agent_state_doc.agents
+        from coral.hub.attempts import _read_all_island_attempts, read_attempts
 
-                runtime_state = agent_states.get(agent_name)
-                paused_until = runtime_state.paused_until if runtime_state else None
-                if paused_until is not None and paused_until > time.time() and manager_alive:
-                    cooldown = int(paused_until - time.time())
-                    status_str = f"PAUSED ({cooldown}s cooldown remaining)"
-                elif age.total_seconds() < 30 and manager_alive:
-                    status_str = "ACTIVE"
-                elif manager_alive:
-                    status_str = f"idle ({int(age.total_seconds())}s since last output)"
-                else:
-                    status_str = "stopped"
+        class_counts: dict[str, dict[str, int]] = {}
+        if island_id is not None or not (coral_dir / "islands").exists():
+            attempts = read_attempts(coral_dir, island_id=island_id)
+        else:
+            attempts = _read_all_island_attempts(coral_dir)
+        for a in attempts:
+            if a.status == "pending":
+                continue
+            bucket = class_counts.setdefault(a.agent_id, {})
+            bucket[a.budget_class] = bucket.get(a.budget_class, 0) + 1
 
-                extras = []
-                if runtime_state and runtime_state.pause_count > 0:
-                    extras.append(f"pauses: {runtime_state.pause_count}")
-                if runtime_state and runtime_state.last_fault_at:
-                    extras.append(f"last fault: {runtime_state.last_fault_at}")
-                extras_str = "  |  " + "  |  ".join(extras) if extras else ""
+        print(f"\nAgents: {len(agent_logs)}")
+        for agent_name, logs in sorted(agent_logs.items()):
+            latest_log = max(logs, key=lambda p: p.stat().st_mtime)
+            log_size = latest_log.stat().st_size
+            mtime = datetime.fromtimestamp(latest_log.stat().st_mtime)
+            age = datetime.now() - mtime
 
-                print(
-                    f"  {agent_name}: {status_str}  |  "
-                    f"sessions: {len(logs)}  |  "
-                    f"latest log: {log_size:,} bytes  |  "
-                    f"last activity: {mtime.strftime('%H:%M:%S')}{extras_str}"
-                )
-                buckets = class_counts.get(agent_name, {})
-                if buckets:
-                    real = buckets.get(BUDGET_CLASS_REAL, 0)
-                    grader_error = buckets.get(BUDGET_CLASS_GRADER_ERROR, 0)
-                    tune = buckets.get(BUDGET_CLASS_TUNE, 0)
-                    total = real + grader_error + tune
-                    if total:
-                        rate_str = f"{grader_error}/{total} ({100 * grader_error / total:.0f}%)"
-                        print(
-                            f"    attempts: real={real}  "
-                            f"grader_error={grader_error}  tune={tune}  "
-                            f"|  grader-error rate: {rate_str}"
-                        )
+            runtime_state = agent_states.get(agent_name)
+            paused_until = runtime_state.paused_until if runtime_state else None
+            if paused_until is not None and paused_until > time.time() and manager_alive:
+                cooldown = int(paused_until - time.time())
+                status_str = f"PAUSED ({cooldown}s cooldown remaining)"
+            elif age.total_seconds() < 30 and manager_alive:
+                status_str = "ACTIVE"
+            elif manager_alive:
+                status_str = f"idle ({int(age.total_seconds())}s since last output)"
+            else:
+                status_str = "stopped"
+
+            extras = []
+            if runtime_state and runtime_state.pause_count > 0:
+                extras.append(f"pauses: {runtime_state.pause_count}")
+            if runtime_state and runtime_state.last_fault_at:
+                extras.append(f"last fault: {runtime_state.last_fault_at}")
+            extras_str = "  |  " + "  |  ".join(extras) if extras else ""
+
+            print(
+                f"  {agent_name}: {status_str}  |  "
+                f"sessions: {len(logs)}  |  "
+                f"latest log: {log_size:,} bytes  |  "
+                f"last activity: {mtime.strftime('%H:%M:%S')}{extras_str}"
+            )
+            buckets = class_counts.get(agent_name, {})
+            if buckets:
+                real = buckets.get(BUDGET_CLASS_REAL, 0)
+                grader_error = buckets.get(BUDGET_CLASS_GRADER_ERROR, 0)
+                tune = buckets.get(BUDGET_CLASS_TUNE, 0)
+                total = real + grader_error + tune
+                if total:
+                    rate_str = f"{grader_error}/{total} ({100 * grader_error / total:.0f}%)"
+                    print(
+                        f"    attempts: real={real}  "
+                        f"grader_error={grader_error}  tune={tune}  "
+                        f"|  grader-error rate: {rate_str}"
+                    )
 
     direction = read_direction(coral_dir)
     print()
-    summary = format_status_summary(str(coral_dir), direction=direction)
+    show_all = getattr(args, "all", False)
+    summary = format_status_summary(
+        str(coral_dir), direction=direction, island_id=island_id, include_tune=show_all
+    )
     print(summary)
 
-    top = get_leaderboard(str(coral_dir), top_n=10, direction=direction)
+    top = get_leaderboard(
+        str(coral_dir), top_n=10, direction=direction, island_id=island_id, include_tune=show_all
+    )
     if top:
         print(f"\n## Leaderboard (top {len(top)})")
         print(format_leaderboard(top))

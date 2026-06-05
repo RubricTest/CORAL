@@ -14,6 +14,8 @@ import os
 import tempfile
 from pathlib import Path
 
+from coral.hub._island import island_root
+
 logger = logging.getLogger(__name__)
 
 # Load prompt templates from markdown files
@@ -62,8 +64,19 @@ PROTECTED_ACTIONS: set[str] = PROTECTED_LOCAL | PROTECTED_GLOBAL
 _GLOBAL_ID = "_global"
 
 
-def _heartbeat_path(coral_dir: Path, agent_id: str) -> Path:
-    return coral_dir / "public" / "heartbeat" / f"{agent_id}.json"
+def _heartbeat_path(
+    coral_dir: Path,
+    agent_id: str,
+    island_id: str | int | None = None,
+) -> Path:
+    return island_root(coral_dir, island_id) / "heartbeat" / f"{agent_id}.json"
+
+
+def _require_write_scope(coral_dir: Path, island_id: str | int | None) -> None:
+    if island_id is None and (coral_dir / "islands").exists():
+        raise ValueError(
+            "island_id is required when writing heartbeat config in a multi-island run"
+        )
 
 
 def _read_actions(path: Path) -> list[dict]:
@@ -99,16 +112,49 @@ def _write_actions(path: Path, actions: list[dict]) -> None:
 # --- Local (per-agent) ---
 
 
-def read_agent_heartbeat(coral_dir: Path, agent_id: str) -> list[dict]:
-    """Read local heartbeat actions for an agent."""
-    return _read_actions(_heartbeat_path(coral_dir, agent_id))
+def read_agent_heartbeat(
+    coral_dir: Path,
+    agent_id: str,
+    island_id: str | int | None = None,
+) -> list[dict]:
+    """Read local heartbeat actions for an agent.
+
+    Routing rules in multi-island mode (``coral_dir/islands/`` exists):
+    - If ``island_id`` is provided, read only that island.
+    - If ``island_id`` is omitted, fan out across every island and merge
+      matches. The prefix in ids like ``0-agent-1`` is birth lineage, not
+      current location after migration.
+    """
+    coral_dir = Path(coral_dir)
+    if island_id is not None or not (coral_dir / "islands").exists():
+        return _read_actions(_heartbeat_path(coral_dir, agent_id, island_id))
+
+    from coral.hub._island import all_view_roots
+
+    merged: list[dict] = []
+    seen: set[tuple] = set()
+    for view_root in all_view_roots(coral_dir):
+        for action in _read_actions(_heartbeat_path(coral_dir, agent_id, island_id=view_root.name)):
+            key = (action.get("name"), action.get("every"), action.get("trigger"))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(action)
+    return merged
 
 
-def write_agent_heartbeat(coral_dir: Path, agent_id: str, actions: list[dict]) -> None:
+def write_agent_heartbeat(
+    coral_dir: Path,
+    agent_id: str,
+    actions: list[dict],
+    island_id: str | int | None = None,
+) -> None:
     """Write local heartbeat actions for an agent.
 
     Protected local actions (reflect) are re-added if missing.
     """
+    coral_dir = Path(coral_dir)
+    _require_write_scope(coral_dir, island_id)
     present = {a["name"] for a in actions}
     for name in PROTECTED_LOCAL:
         if name not in present:
@@ -119,22 +165,59 @@ def write_agent_heartbeat(coral_dir: Path, agent_id: str, actions: list[dict]) -
                     "prompt": DEFAULT_PROMPTS.get(name, ""),
                 }
             )
-    _write_actions(_heartbeat_path(coral_dir, agent_id), actions)
+    _write_actions(_heartbeat_path(coral_dir, agent_id, island_id), actions)
 
 
 # --- Global (shared across all agents) ---
 
 
-def read_global_heartbeat(coral_dir: Path) -> list[dict]:
-    """Read global heartbeat actions."""
-    return _read_actions(_heartbeat_path(coral_dir, _GLOBAL_ID))
+def read_global_heartbeat(
+    coral_dir: Path,
+    island_id: str | int | None = None,
+) -> list[dict]:
+    """Read global heartbeat actions.
+
+    With ``island_id=None`` in multi-island mode, merges global heartbeats
+    across every island (deduped by action name) so a per-island override
+    on one island doesn't shadow the others.
+    """
+    coral_dir = Path(coral_dir)
+    if island_id is not None or not (coral_dir / "islands").exists():
+        return _read_actions(_heartbeat_path(coral_dir, _GLOBAL_ID, island_id))
+
+    from coral.hub._island import all_view_roots
+
+    merged: list[dict] = []
+    seen: set[tuple] = set()
+    for view_root in all_view_roots(coral_dir):
+        for action in _read_actions(
+            _heartbeat_path(coral_dir, _GLOBAL_ID, island_id=view_root.name)
+        ):
+            # Dedup by (name, every, trigger) so identical defaults across
+            # islands collapse; distinct per-island overrides still surface.
+            key = (
+                action.get("name"),
+                action.get("every"),
+                action.get("trigger"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(action)
+    return merged
 
 
-def write_global_heartbeat(coral_dir: Path, actions: list[dict]) -> None:
+def write_global_heartbeat(
+    coral_dir: Path,
+    actions: list[dict],
+    island_id: str | int | None = None,
+) -> None:
     """Write global heartbeat actions.
 
     Protected global actions (consolidate) are re-added if missing.
     """
+    coral_dir = Path(coral_dir)
+    _require_write_scope(coral_dir, island_id)
     present = {a["name"] for a in actions}
     for name in PROTECTED_GLOBAL:
         if name not in present:
@@ -145,7 +228,7 @@ def write_global_heartbeat(coral_dir: Path, actions: list[dict]) -> None:
                     "prompt": DEFAULT_PROMPTS.get(name, ""),
                 }
             )
-    _write_actions(_heartbeat_path(coral_dir, _GLOBAL_ID), actions)
+    _write_actions(_heartbeat_path(coral_dir, _GLOBAL_ID, island_id), actions)
 
 
 # --- Defaults from config ---

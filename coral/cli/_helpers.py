@@ -8,6 +8,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+from coral.workspace.breadcrumbs import (
+    find_breadcrumb_file,
+    find_coral_breadcrumb,
+    read_island_breadcrumb,
+)
+
 
 def setup_logging(verbose: bool = False) -> None:
     """Configure logging. Verbose mode logs to stderr at DEBUG level."""
@@ -282,12 +288,23 @@ def kill_orphaned_agents(agent_pids_file: Path) -> None:
     agent_pids_file.unlink(missing_ok=True)
 
 
-def read_agent_id() -> str:
-    """Read agent ID from .coral_agent_id file in cwd."""
-    agent_id_file = Path.cwd() / ".coral_agent_id"
-    if agent_id_file.exists():
+def read_agent_id(start: str | Path | None = None) -> str:
+    """Read agent ID from the nearest .coral_agent_id breadcrumb."""
+    agent_id_file = find_breadcrumb_file(".coral_agent_id", start)
+    if agent_id_file is not None:
         return agent_id_file.read_text().strip()
     return "unknown"
+
+
+def find_worktree_coral_dir_and_island(
+    start: str | Path | None = None,
+) -> tuple[Path, str | None] | None:
+    """Find the current worktree's run and island without falling back or exiting."""
+    found = find_coral_breadcrumb(start)
+    if found is None:
+        return None
+    coral_dir, breadcrumb_dir = found
+    return coral_dir, read_island_breadcrumb(coral_dir, breadcrumb_dir)
 
 
 def read_direction(coral_dir: Path) -> str:
@@ -302,6 +319,39 @@ def read_direction(coral_dir: Path) -> str:
     return "maximize"
 
 
+def find_coral_dir_and_island(
+    task: str | None = None,
+    run: str | None = None,
+) -> tuple[Path, str | None]:
+    """Find the .coral directory and the current agent's island_id, if any.
+
+    Search order:
+    1. Walk up from cwd looking for a ``.coral_dir`` breadcrumb. If found,
+       pair it with a ``.coral_island`` breadcrumb in the same directory.
+       ``island_id`` is the breadcrumb's contents when:
+         - the file exists, AND
+         - its value is non-empty, AND
+         - ``coral_dir / "islands" / <value>`` is a real directory.
+       Otherwise ``island_id`` is None (single-island run, or stale
+       breadcrumb pointing at a deleted island).
+    2. Fall back to :func:`find_coral_dir`'s ``--task``/``--run`` logic and
+       return ``(coral_dir, None)`` — an explicit ``--task`` must override
+       the worktree scope, never silently keep it.
+
+    Returns:
+        (coral_dir, island_id) — island_id is None unless the caller is
+        inside an agent worktree that advertises a valid island.
+    """
+    if not task and not run:
+        found = find_worktree_coral_dir_and_island()
+        if found is not None:
+            return found
+
+    # Fall through to --task/--run discovery; explicit --task/--run wins
+    # and we never silently scope by island in that mode.
+    return find_coral_dir(task, run), None
+
+
 def find_coral_dir(task: str | None = None, run: str | None = None) -> Path:
     """Find the .coral directory for a task run.
 
@@ -313,14 +363,10 @@ def find_coral_dir(task: str | None = None, run: str | None = None) -> Path:
     """
     # Priority 1: read .coral_dir breadcrumb from cwd (agents always have this)
     if not task and not run:
-        coral_dir_file = Path.cwd() / ".coral_dir"
-        if coral_dir_file.exists():
-            try:
-                coral_dir = Path(coral_dir_file.read_text().strip()).resolve()
-                if coral_dir.is_dir():
-                    return coral_dir
-            except (OSError, ValueError):
-                pass
+        found = find_coral_breadcrumb()
+        if found is not None:
+            coral_dir, _breadcrumb_dir = found
+            return coral_dir
 
     # Docker shortcut: run dir is mounted at /run, no results/ tree exists
     if in_docker():
@@ -430,9 +476,9 @@ def pick_run(status_filter: str | None = None, allow_cancel: bool = False) -> Pa
     rw = max(len("RUN"), max(len(r["run"]) for r in runs)) + 2
     sw = max(len("STATUS"), 10) + 2
 
-    header = (
-        f"{'#':>3}  {'TASK':<{tw}}{'RUN':<{rw}}{'STATUS':<{sw}}{'AGENTS':>7}{'EVALS':>7}{'BEST':>9}"
-    )
+    # BEST width 12 leaves a 2-char gap after EVALS so multi-digit scores
+    # (e.g. 4838.0000) don't visually fuse with the EVALS column.
+    header = f"{'#':>3}  {'TASK':<{tw}}{'RUN':<{rw}}{'STATUS':<{sw}}{'AGENTS':>7}{'EVALS':>7}{'BEST':>12}"
     print(header)
     print("-" * len(header))
 
@@ -444,7 +490,7 @@ def pick_run(status_filter: str | None = None, allow_cancel: bool = False) -> Pa
         best_str = f"{r['best']:.4f}" if r["best"] is not None else "-"
         print(
             f"{i:>3}  {r['task']:<{tw}}{r['run']:<{rw}}{status_str:<{sw}}"
-            f"{r['agents']:>7}{r['attempts']:>7}{best_str:>9}"
+            f"{r['agents']:>7}{r['attempts']:>7}{best_str:>12}"
         )
 
     print()

@@ -8,9 +8,11 @@ from typing import Any
 
 import yaml
 
+from coral.hub._island import island_root
 
-def _skills_dir(coral_dir: str | Path) -> Path:
-    d = Path(coral_dir) / "public" / "skills"
+
+def _skills_dir(coral_dir: str | Path, island_id: str | int | None = None) -> Path:
+    d = island_root(coral_dir, island_id) / "skills"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -26,10 +28,41 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     return {}, text
 
 
-def list_skills(coral_dir: str | Path) -> list[dict[str, Any]]:
-    """List all skills with name + description from SKILL.md frontmatter."""
-    d = _skills_dir(coral_dir)
+def list_skills(
+    coral_dir: str | Path,
+    island_id: str | int | None = None,
+) -> list[dict[str, Any]]:
+    """List all skills with name + description from SKILL.md frontmatter.
+
+    With ``island_id=None`` in multi-island mode, aggregates skills from
+    every island so ``coral skills`` shows the whole team's toolset.
+    """
+    coral_dir = Path(coral_dir)
+    if island_id is not None or not (coral_dir / "islands").exists():
+        return _list_skills_single(coral_dir, island_id)
+
+    from coral.hub._island import all_view_roots
+
+    results: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for view_root in all_view_roots(coral_dir):
+        for entry in _list_skills_single(coral_dir, island_id=view_root.name):
+            if entry["name"] in seen_names:
+                # Same skill name on multiple islands — keep the first by
+                # sorted-island order, tag the path so the user can see
+                # which island owns the copy they were shown.
+                continue
+            seen_names.add(entry["name"])
+            entry["island_id"] = view_root.name
+            results.append(entry)
+    return results
+
+
+def _list_skills_single(coral_dir: Path, island_id: str | int | None) -> list[dict[str, Any]]:
+    d = _skills_dir(coral_dir, island_id)
     results = []
+    if not d.is_dir():
+        return results
     for skill_dir in sorted(d.iterdir()):
         if not skill_dir.is_dir():
             continue
@@ -102,3 +135,33 @@ def get_skill_tree(skill_dir: str | Path) -> str:
 
     _tree(skill_dir)
     return "\n".join(lines)
+
+
+def skills_by(
+    coral_dir: str | Path,
+    island_id: str | int | None,
+    agent_id: str,
+) -> list[Path]:
+    """Return absolute paths of skill directories whose SKILL.md frontmatter
+    `creator` matches agent_id.
+
+    Skills without a `creator:` field are treated as bundled-framework skills
+    (deep-research, librarian, skill-creator, organize-files) and excluded —
+    they are seeded per-island already and should not migrate.
+    """
+    skills_dir = _skills_dir(coral_dir, island_id)
+    matched: list[Path] = []
+    for sk_dir in sorted(skills_dir.iterdir()):
+        if not sk_dir.is_dir():
+            continue
+        skill_md = sk_dir / "SKILL.md"
+        if not skill_md.exists():
+            continue
+        try:
+            text = skill_md.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        meta, _ = _parse_frontmatter(text)
+        if meta.get("creator") == agent_id:
+            matched.append(sk_dir)
+    return matched

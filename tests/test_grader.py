@@ -139,7 +139,7 @@ def test_swebench_parse_job_result_uses_completed_trials():
         job_dir_p = Path(job_dir)
         result = _make_swebench_result(n_completed=5, n_passed=2)
         pass_rate, feedback = grader._parse_job_result(
-            result, job_dir_p, elapsed=1983.0, tier_name="Tier 1"
+            result, job_dir_p, elapsed=1983.0, mode="tune"
         )
 
     assert pass_rate == pytest.approx(0.4), (
@@ -159,7 +159,7 @@ def test_swebench_parse_job_result_zero_completed_returns_zero():
     with tempfile.TemporaryDirectory() as job_dir:
         result = _make_swebench_result(n_completed=0, n_passed=0)
         pass_rate, feedback = grader._parse_job_result(
-            result, Path(job_dir), elapsed=60.0, tier_name="Tier 1"
+            result, Path(job_dir), elapsed=60.0, mode="tune"
         )
 
     assert pass_rate == 0.0
@@ -193,9 +193,7 @@ def test_swebench_parse_with_real_harbor_result():
     grader.config = GraderConfig(args={})
 
     job_result = json.loads(real.read_text())
-    pass_rate, feedback = grader._parse_job_result(
-        job_result, job_dir, elapsed=1983.0, tier_name="Tier 1"
-    )
+    pass_rate, feedback = grader._parse_job_result(job_result, job_dir, elapsed=1983.0, mode="tune")
     # The saved attempt had 5 trials, 2 passing (per reward_stats) → 0.4.
     assert pass_rate == pytest.approx(0.4), f"expected 0.4 from real harbor output, got {pass_rate}"
     assert "No trials completed" not in feedback
@@ -210,7 +208,7 @@ def test_terminal_bench_parse_job_result_uses_completed_trials():
     with tempfile.TemporaryDirectory() as job_dir:
         result = _make_terminal_bench_result(n_completed=4, n_passed=2)
         pass_rate, feedback = grader._parse_job_result(
-            result, Path(job_dir), elapsed=1200.0, tier_name="Tier 1"
+            result, Path(job_dir), elapsed=1200.0, mode="tune"
         )
 
     assert pass_rate == pytest.approx(0.5), f"expected 2/4 = 50% pass rate, got {pass_rate:.1%}"
@@ -226,7 +224,7 @@ def test_terminal_bench_parse_job_result_zero_completed_returns_zero():
     with tempfile.TemporaryDirectory() as job_dir:
         result = _make_terminal_bench_result(n_completed=0, n_passed=0)
         pass_rate, feedback = grader._parse_job_result(
-            result, Path(job_dir), elapsed=60.0, tier_name="Tier 1"
+            result, Path(job_dir), elapsed=60.0, mode="tune"
         )
 
     assert pass_rate == 0.0
@@ -428,3 +426,82 @@ def test_loader_raises_when_no_grader_configured():
         config = CoralConfig(task=TaskConfig(name="t", description="d"))
         with pytest.raises(ValueError, match="entrypoint"):
             load_grader(config, coral_dir)
+
+
+# --- eval_logs_dir: island-aware path resolution ----------------------------
+#
+# Regression: the multi-island refactor changed the worktree symlink to point
+# at `.coral/islands/<island_id>/eval_logs/` (per-island) but left the grader
+# hardcoded to write into `.coral/public/eval_logs/`. The two paths diverged
+# and agents could not see their own eval logs. eval_logs_dir must mirror the
+# per-island layout used by attempts/skills/notes.
+
+
+def _bare_task_grader(private_dir: Path, codebase_path: Path, island_id=None) -> TaskGrader:
+    """Build a TaskGrader with just enough state to exercise eval_logs_dir.
+
+    TaskGrader is abstract (requires evaluate()), so we subclass with a noop
+    that returns an empty ScoreBundle — the property under test never calls
+    evaluate() anyway. private_dir, codebase_path, and island_id are normally
+    set by the daemon before grade() runs; we set them as plain attributes.
+    """
+
+    class _Noop(TaskGrader):
+        def evaluate(self):
+            return ScoreBundle(scores={}, aggregated=0.0, feedback="")
+
+    g = _Noop(config=GraderConfig(args={}))
+    g.private_dir = str(private_dir)
+    g.codebase_path = str(codebase_path)
+    g.island_id = island_id
+    return g
+
+
+def test_eval_logs_dir_single_island_writes_under_public():
+    """island_id=None → .coral/public/eval_logs/<checkout_dir_name>/ (legacy)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        coral = Path(tmp)
+        (coral / "private").mkdir()
+        checkout = coral / "private" / "grader_checkouts" / "abc1234"
+        checkout.mkdir(parents=True)
+        g = _bare_task_grader(coral / "private", codebase_path=checkout, island_id=None)
+
+        out = g.eval_logs_dir
+
+        assert out == coral / "public" / "eval_logs" / "abc1234"
+        assert out.is_dir()
+
+
+def test_eval_logs_dir_multi_island_writes_under_island_dir():
+    """island_id set → .coral/islands/<island_id>/eval_logs/<checkout_dir_name>/.
+
+    Mirrors the symlink that setup_shared_state creates at
+    `<worktree>/.claude/eval_logs/` (workspace/worktree.py), so the agent
+    can actually navigate to its own logs.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        coral = Path(tmp)
+        (coral / "private").mkdir()
+        checkout = coral / "private" / "grader_checkouts" / "deadbeef"
+        checkout.mkdir(parents=True)
+        g = _bare_task_grader(coral / "private", codebase_path=checkout, island_id="0")
+
+        out = g.eval_logs_dir
+
+        assert out == coral / "islands" / "0" / "eval_logs" / "deadbeef"
+        assert out.is_dir()
+
+
+def test_eval_logs_dir_island_id_as_int_coerced_to_str():
+    """Daemon may pass island_id as int; path construction must not crash."""
+    with tempfile.TemporaryDirectory() as tmp:
+        coral = Path(tmp)
+        (coral / "private").mkdir()
+        checkout = coral / "private" / "grader_checkouts" / "feedface"
+        checkout.mkdir(parents=True)
+        g = _bare_task_grader(coral / "private", codebase_path=checkout, island_id=2)
+
+        out = g.eval_logs_dir
+
+        assert out == coral / "islands" / "2" / "eval_logs" / "feedface"
+        assert out.is_dir()

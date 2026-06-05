@@ -7,6 +7,8 @@ import json
 import logging
 import multiprocessing
 import os
+import random
+import shutil
 import signal
 import threading
 import time
@@ -15,7 +17,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from coral.agent.assignments import AgentSpec, resolve_agent_specs
+from coral.agent.assignments import (
+    AgentSpec,
+    partition_into_islands,
+    resolve_agent_specs,
+)
 from coral.agent.exit_classifier import (
     classify_by_uptime,
 )
@@ -23,6 +29,12 @@ from coral.agent.exit_classifier import (
     claude_code_log_has_session_error as _log_has_session_error,
 )
 from coral.agent.heartbeat import HeartbeatRunner
+from coral.agent.migration import (
+    IslandRoster,
+    MigrationCandidate,
+    MigrationRunner,
+    choose_roster_balanced_subset,
+)
 from coral.agent.registry import get_runtime
 from coral.agent.runtime import AgentHandle, AgentRuntime
 from coral.agent.state import (
@@ -33,7 +45,13 @@ from coral.agent.state import (
 )
 from coral.agent.warmstart import WarmStartRunner
 from coral.config import CoralConfig
-from coral.hub.attempts import agent_in_grader_queue, read_attempts
+from coral.hub._island import island_root
+from coral.hub.attempts import (
+    agent_in_grader_queue,
+    get_leaderboard,
+    read_attempts,
+    read_eval_count,
+)
 from coral.hub.heartbeat import (
     DEFAULT_PROMPTS,
     DEFAULT_TRIGGER,
@@ -51,6 +69,7 @@ from coral.workspace import (
     apply_runtime_mounts,
     create_agent_worktree,
     create_project,
+    repoint_shared_state,
     seed_agent_role,
     setup_claude_settings,
     setup_codex_settings,
@@ -77,11 +96,15 @@ class AgentManager:
     ) -> None:
         self.config = config
         self.config_dir = config_dir
-        # Resolve concrete per-agent specs once. In uniform mode this is just
-        # ``agents.count`` copies of the top-level defaults; in mix-and-match
-        # mode each ``agents.assignments`` entry contributes ``count`` specs
-        # with its own runtime/model/runtime_options.
-        self.specs: list[AgentSpec] = resolve_agent_specs(config)
+        # Resolve concrete per-agent specs, then (when multi-island) partition them
+        # across islands round-robin. Single-island (count=1) returns specs unchanged.
+        base_specs = resolve_agent_specs(config)
+        if config.islands.count > len(base_specs):
+            raise ValueError(
+                "islands.count cannot exceed the number of agents "
+                f"(got islands.count={config.islands.count}, agents={len(base_specs)})"
+            )
+        self.specs: list[AgentSpec] = partition_into_islands(base_specs, count=config.islands.count)
         self.specs_by_id: dict[str, AgentSpec] = {s.agent_id: s for s in self.specs}
         # One runtime instance per agent_id. In uniform mode all entries point
         # to the same class; in mix-and-match mode each agent uses its own.
@@ -102,6 +125,11 @@ class AgentManager:
         self._restart_counts: dict[str, int] = {}
         self._agent_eval_counts: dict[str, int] = {}
         self._agent_best_scores: dict[str, float] = {}
+        # Per-agent island lookup. Pre-populated from partitioned specs; empty
+        # in single-island mode (specs all have island_id=None).
+        self._agent_island: dict[str, str] = {
+            s.agent_id: s.island_id for s in self.specs if s.island_id is not None
+        }
         # Per-agent score history (real attempts only, in submit order).
         # ``None`` entries represent grader-error attempts and apply plateau
         # pressure without changing any anchor. The plateau streak each
@@ -128,6 +156,22 @@ class AgentManager:
         self._gateway_keys: dict[str, str] = {}  # agent_id -> proxy key
         self._grader_proc: multiprocessing.Process | None = None
         self._grader_stop_event: Any | None = None  # multiprocessing.Event
+        # Island migration. Only meaningful with >=2 islands and migration
+        # enabled in the config; otherwise should_run() short-circuits to
+        # False and run_cycle() returns [].
+        self._migration_runner: MigrationRunner = MigrationRunner(
+            config.islands,
+            minimize=(config.grader.direction == "minimize"),
+            rng=random.Random(),
+        )
+        # The last migration batch that could not apply because at least one
+        # candidate was temporarily blocked (paused, or had a pending grader
+        # attempt). Retried on every monitor tick before fresh candidate
+        # selection so a blocked swap resumes as soon as the grader clears,
+        # without waiting for the next full migration cadence.
+        # Each entry: (candidate, reason). Deferred batches retry until they
+        # apply or go stale; paused agents can stay paused for arbitrarily long.
+        self._deferred_candidates: list[tuple[MigrationCandidate, str]] = []
 
     def _runtime_for(self, agent_id: str) -> AgentRuntime:
         """Return the runtime instance for an agent_id, creating one on demand.
@@ -172,10 +216,23 @@ class AgentManager:
         #     and writes the score back. Must be running before agents start.
         self._start_grader_daemon()
 
-        # 2. Seed global heartbeat config if not already present
-        if not read_global_heartbeat(self.paths.coral_dir):
-            write_global_heartbeat(self.paths.coral_dir, default_global_actions(self.config))
-            logger.info("Seeded global heartbeat config")
+        # 2. Seed global heartbeat config if not already present.
+        # In multi-island mode, every island gets its own _global.json so
+        # cadence reads the per-island eval_count for "global" actions like
+        # consolidate.
+        if self.config.islands.count > 1:
+            for island_id in {s.island_id for s in self.specs if s.island_id is not None}:
+                if not read_global_heartbeat(self.paths.coral_dir, island_id=island_id):
+                    write_global_heartbeat(
+                        self.paths.coral_dir,
+                        default_global_actions(self.config),
+                        island_id=island_id,
+                    )
+                    logger.info(f"Seeded global heartbeat config for island {island_id}")
+        else:
+            if not read_global_heartbeat(self.paths.coral_dir):
+                write_global_heartbeat(self.paths.coral_dir, default_global_actions(self.config))
+                logger.info("Seeded global heartbeat config")
 
         # 3. Warm-start research phase (optional)
         agent_ids = [s.agent_id for s in self.specs]
@@ -188,12 +245,15 @@ class AgentManager:
         # 4. For each agent: create worktree, generate CLAUDE.md, spawn runtime
         handles = []
         for i, agent_id in enumerate(agent_ids):
+            spec = self.specs_by_id.get(agent_id)
+            island_id = spec.island_id if spec else None
             if i > 0 and self.config.agents.stagger_seconds > 0:
                 logger.info(f"Staggering {agent_id} by {self.config.agents.stagger_seconds}s")
                 time.sleep(self.config.agents.stagger_seconds)
             shared_dir = self._runtime_for(agent_id).shared_dir_name
             handle = self._setup_and_start_agent(
                 agent_id,
+                island_id=island_id,
                 resume_session_id=research_sessions.get(agent_id),
                 prompt=warmstart.main_prompt(shared_dir) if warmstart.enabled else None,
                 prompt_source="warmstart:main" if warmstart.enabled else None,
@@ -349,11 +409,14 @@ class AgentManager:
 
         research_handles = []
         for i, agent_id in enumerate(agent_ids):
+            spec = self.specs_by_id.get(agent_id)
+            island_id = spec.island_id if spec else None
             if i > 0 and self.config.agents.stagger_seconds > 0:
                 time.sleep(self.config.agents.stagger_seconds)
             shared_dir = self._runtime_for(agent_id).shared_dir_name
             handle = self._setup_and_start_agent(
                 agent_id,
+                island_id=island_id,
                 prompt=warmstart.research_prompt(shared_dir),
                 prompt_source="warmstart:research",
             )
@@ -379,6 +442,7 @@ class AgentManager:
     def _setup_and_start_agent(
         self,
         agent_id: str,
+        island_id: str | None = None,
         resume_session_id: str | None = None,
         prompt: str | None = None,
         prompt_source: str | None = None,
@@ -389,6 +453,11 @@ class AgentManager:
 
         runtime = self._runtime_for(agent_id)
         spec = self.specs_by_id.get(agent_id)
+
+        # Track which island this agent belongs to. Single-island mode (None)
+        # leaves _agent_island untouched; downstream lookups simply miss.
+        if island_id is not None:
+            self._agent_island[agent_id] = island_id
 
         # Create worktree (idempotent)
         logger.info(f"Setting up {agent_id}...")
@@ -410,7 +479,12 @@ class AgentManager:
 
         # Set up shared state directory (notes, skills, attempts symlinks)
         shared_dir_name = runtime.shared_dir_name
-        setup_shared_state(worktree_path, self.paths.coral_dir, shared_dir_name)
+        setup_shared_state(
+            worktree_path,
+            self.paths.coral_dir,
+            shared_dir_name,
+            island_id=island_id,
+        )
 
         # Register agent with gateway if active (before settings so we have the key)
         if self._gateway and agent_id not in self._gateway_keys:
@@ -439,6 +513,7 @@ class AgentManager:
                 research=self.config.agents.research,
                 gateway_url=gateway_url,
                 gateway_api_key=gateway_api_key,
+                island_id=island_id,
             )
         elif shared_dir_name == ".opencode":
             setup_opencode_settings(
@@ -447,6 +522,7 @@ class AgentManager:
                 research=self.config.agents.research,
                 gateway_url=gateway_url,
                 gateway_api_key=gateway_api_key,
+                island_id=island_id,
             )
         elif shared_dir_name == ".codex":
             setup_codex_settings(
@@ -455,6 +531,7 @@ class AgentManager:
                 research=self.config.agents.research,
                 gateway_url=gateway_url,
                 gateway_api_key=gateway_api_key,
+                island_id=island_id,
             )
         elif shared_dir_name == ".cursor":
             setup_cursor_settings(
@@ -463,6 +540,7 @@ class AgentManager:
                 research=self.config.agents.research,
                 gateway_url=gateway_url,
                 gateway_api_key=gateway_api_key,
+                island_id=island_id,
             )
 
         # Apply per-agent file mounts last so the user's files win over
@@ -473,9 +551,12 @@ class AgentManager:
             apply_runtime_mounts(worktree_path, mounts, self._mounts_base_dir())
 
         # Seed local heartbeat config from task YAML if not already present
-        if not read_agent_heartbeat(self.paths.coral_dir, agent_id):
+        if not read_agent_heartbeat(self.paths.coral_dir, agent_id, island_id=island_id):
             write_agent_heartbeat(
-                self.paths.coral_dir, agent_id, default_local_actions(self.config)
+                self.paths.coral_dir,
+                agent_id,
+                default_local_actions(self.config),
+                island_id=island_id,
             )
             logger.info(f"  Seeded heartbeat config for {agent_id}")
 
@@ -485,13 +566,16 @@ class AgentManager:
         # Seed the agent's role description (idempotent — preserves the
         # evolved role on resume). When ``runtime_options.role_file``
         # is set, the user-provided .md is copied as the gen-0 seed; otherwise
-        # the bundled blank template is rendered.
+        # the bundled blank template is rendered. In multi-island runs the
+        # file lands under islands/<id>/roles/ so the worktree symlink
+        # installed by setup_shared_state resolves to a real file.
         role_file = (runtime_options or {}).get("role_file")
         seed_agent_role(
             self.paths.coral_dir,
             agent_id,
             source=role_file,
             base_dir=self._mounts_base_dir() if role_file else None,
+            island_id=island_id,
         )
 
         # Generate instruction file (CLAUDE.md, AGENTS.md, etc.)
@@ -502,10 +586,16 @@ class AgentManager:
             agent_id,
             single_agent=single_agent,
             shared_dir=shared_dir_name,
+            island_id=island_id,
         )
         (worktree_path / instruction_file).write_text(coral_md)
 
         # Start agent
+        if island_id is not None:
+            log_dir = self.paths.coral_dir / "islands" / str(island_id) / "logs"
+        else:
+            log_dir = self.paths.coral_dir / "public" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
         handle = runtime.start(
             worktree_path=worktree_path,
             coral_md_path=worktree_path / instruction_file,
@@ -513,7 +603,7 @@ class AgentManager:
             runtime_options=runtime_options,
             max_turns=max_turns if max_turns is not None else self.config.agents.max_turns,
             verbose=self.verbose,
-            log_dir=self.paths.coral_dir / "public" / "logs",
+            log_dir=log_dir,
             resume_session_id=resume_session_id,
             prompt=prompt,
             prompt_source=prompt_source,
@@ -551,8 +641,15 @@ class AgentManager:
         else:
             logger.info(f"Starting {agent_id} fresh (no session to resume)")
 
+        spec = self.specs_by_id.get(agent_id)
+        # Prefer the live `_agent_island` map over `spec.island_id`: after a
+        # resume the spec is rebuilt from config (birth island) but the
+        # breadcrumb-restored map reflects post-migration state.
+        island_id = self._agent_island.get(agent_id) or (spec.island_id if spec else None)
+
         return self._setup_and_start_agent(
             agent_id,
+            island_id=island_id,
             resume_session_id=session_id,
             prompt=prompt,
             prompt_source=prompt_source or "restart",
@@ -580,8 +677,15 @@ class AgentManager:
         else:
             logger.warning(f"No session_id for {agent_id}, starting fresh")
 
+        spec = self.specs_by_id.get(agent_id)
+        # Prefer the live `_agent_island` map over `spec.island_id`: after a
+        # resume the spec is rebuilt from config (birth island) but the
+        # breadcrumb-restored map reflects post-migration state.
+        island_id = self._agent_island.get(agent_id) or (spec.island_id if spec else None)
+
         return self._setup_and_start_agent(
             agent_id,
+            island_id=island_id,
             resume_session_id=session_id,
             prompt=prompt,
             prompt_source=prompt_source,
@@ -639,6 +743,18 @@ class AgentManager:
             agent_id = agent_dir.name
             session_id = validated_sessions.get(agent_id)
 
+            # Recover island_id from .coral_island breadcrumb if present
+            island_bc = agent_dir / ".coral_island"
+            island_id: str | None = None
+            if island_bc.exists():
+                try:
+                    island_id = island_bc.read_text().strip() or None
+                except OSError:
+                    island_id = None
+            # Track it so subsequent restarts can use it
+            if island_id is not None:
+                self._agent_island[agent_id] = island_id
+
             # Fallback: extract from latest log file
             if not session_id:
                 session_id = self._find_latest_session_from_logs(agent_id)
@@ -659,6 +775,7 @@ class AgentManager:
 
             handle = self._setup_and_start_agent(
                 agent_id,
+                island_id=island_id,
                 resume_session_id=session_id,
                 prompt=prompt,
             )
@@ -765,12 +882,34 @@ class AgentManager:
         return bool(proc and proc.is_alive())
 
     def _get_seen_attempts(self) -> set[str]:
-        """Get the set of attempt filenames currently in .coral/public/attempts/."""
+        """Get the set of attempt filenames currently in any island's attempts dir."""
         assert self.paths is not None
-        attempts_dir = self.paths.coral_dir / "public" / "attempts"
+        coral_dir = self.paths.coral_dir
+        islands_dir = coral_dir / "islands"
+        if islands_dir.exists():
+            seen: set[str] = set()
+            for island in islands_dir.iterdir():
+                attempts = island / "attempts"
+                if attempts.exists():
+                    seen.update(f.name for f in attempts.glob("*.json"))
+            return seen
+        attempts_dir = coral_dir / "public" / "attempts"
         if not attempts_dir.exists():
             return set()
         return {f.name for f in attempts_dir.glob("*.json")}
+
+    def _resolve_attempt_path(self, fname: str) -> Path | None:
+        """Look up an attempt JSON file across all islands or public/."""
+        assert self.paths is not None
+        coral_dir = self.paths.coral_dir
+        islands_dir = coral_dir / "islands"
+        if islands_dir.exists():
+            for island in islands_dir.iterdir():
+                p = island / "attempts" / fname
+                if p.exists():
+                    return p
+        p = coral_dir / "public" / "attempts" / fname
+        return p if p.exists() else None
 
     def _filter_scored(self, new_files: set[str]) -> set[str]:
         """Return only those filenames whose attempt status is not 'pending'.
@@ -780,11 +919,11 @@ class AgentManager:
         grader daemon finalizes them. Malformed files are also skipped and
         will be retried next tick.
         """
-        assert self.paths is not None
-        attempts_dir = self.paths.coral_dir / "public" / "attempts"
         scored: set[str] = set()
         for fname in new_files:
-            path = attempts_dir / fname
+            path = self._resolve_attempt_path(fname)
+            if path is None:
+                continue
             try:
                 data = json.loads(path.read_text())
             except (json.JSONDecodeError, OSError):
@@ -804,14 +943,12 @@ class AgentManager:
         considered. This prevents cross-agent score leakage when building a
         resume prompt for a dying agent in multi-agent runs.
         """
-        assert self.paths is not None
-        attempts_dir = self.paths.coral_dir / "public" / "attempts"
         newest_path: Path | None = None
         newest_data: dict[str, Any] | None = None
         newest_mtime = 0.0
         for fname in new_files:
-            path = attempts_dir / fname
-            if not path.exists():
+            path = self._resolve_attempt_path(fname)
+            if path is None:
                 continue
             mtime = path.stat().st_mtime
             if mtime <= newest_mtime:
@@ -843,9 +980,13 @@ class AgentManager:
         return None
 
     def _get_eval_count(self) -> int:
-        """Read the current eval count from .coral/eval_count."""
+        """Read the current global eval count."""
         assert self.paths is not None
-        counter_file = self.paths.coral_dir / "public" / "eval_count"
+        coral_dir = self.paths.coral_dir
+        if (coral_dir / "islands").exists():
+            counter_file = coral_dir / "eval_count"
+        else:
+            counter_file = coral_dir / "public" / "eval_count"
         if counter_file.exists():
             try:
                 return int(counter_file.read_text().strip())
@@ -853,15 +994,38 @@ class AgentManager:
                 pass
         return 0
 
+    def _get_migration_eval_count(self) -> int:
+        """Count finalized real attempts for migration cadence.
+
+        Raw eval counters include tune and grader-error attempts. Migration
+        selection intentionally ignores those, so using the raw counter can
+        consume a cycle before any source island has eligible real signal.
+        """
+        assert self.paths is not None
+        coral_dir = self.paths.coral_dir
+        if (coral_dir / "islands").exists():
+            attempts = []
+            for island_dir in sorted((coral_dir / "islands").iterdir()):
+                if island_dir.is_dir():
+                    attempts.extend(read_attempts(coral_dir, island_id=island_dir.name))
+        else:
+            attempts = read_attempts(coral_dir)
+        return sum(
+            1
+            for attempt in attempts
+            if attempt.status != "pending" and attempt.budget_class == BUDGET_CLASS_REAL
+        )
+
     def _get_heartbeat_runner(self, agent_id: str) -> HeartbeatRunner:
         """Build a HeartbeatRunner by merging local + global heartbeat configs."""
         from coral.agent.heartbeat import HeartbeatAction
 
         assert self.paths is not None
         shared_dir = self._runtime_for(agent_id).shared_dir_name
+        island_id = self._agent_island.get(agent_id)
 
-        local_actions = read_agent_heartbeat(self.paths.coral_dir, agent_id)
-        global_actions = read_global_heartbeat(self.paths.coral_dir)
+        local_actions = read_agent_heartbeat(self.paths.coral_dir, agent_id, island_id=island_id)
+        global_actions = read_global_heartbeat(self.paths.coral_dir, island_id=island_id)
 
         heartbeat_actions = []
         for ad in local_actions:
@@ -1182,6 +1346,471 @@ class AgentManager:
         )
         return "\n".join(lines)
 
+    # ------------------------------------------------------------------
+    # Migration
+    # ------------------------------------------------------------------
+    def _maybe_run_migration_cycle(self) -> None:
+        """Run one migration cycle iff the runner says we crossed a boundary.
+
+        Cheap to call every tick: the runner short-circuits when migration
+        is disabled or the run is single-island. When a cycle does fire,
+        each planned migration is applied via :meth:`_apply_migration`;
+        partial failures are logged and skipped so one bad candidate
+        doesn't sink the rest of the cycle.
+
+        Soft-failed candidates from prior cycles, such as paused agents,
+        live in ``self._deferred_candidates`` and are retried at the top
+        of the next cycle before fresh candidates are computed.
+        """
+        runner = self._migration_runner
+        if not runner.enabled or self.paths is None:
+            return
+        if self._retry_deferred_migration_batch():
+            return
+        current_evals = self._get_migration_eval_count()
+        if not runner.should_run(current_global_evals=current_evals):
+            return
+
+        best_scores = self._gather_island_best_scores()
+        migrations = runner.run_cycle(
+            coral_dir=self.paths.coral_dir,
+            island_best_scores=best_scores,
+            current_agent_islands=dict(self._agent_island),
+        )
+        # Mark the cycle as done even if no candidates matched — otherwise
+        # every subsequent tick would re-enter run_cycle on the same boundary.
+        runner.mark_cycle_complete(current_global_evals=current_evals)
+
+        migrations = self._select_executable_migration_batch(
+            self._filter_current_migration_candidates(migrations)
+        )
+
+        if not migrations:
+            logger.info(
+                f"Migration cycle @ real eval#{current_evals}: no executable migration candidates"
+            )
+            return
+
+        self._apply_migration_batch(migrations, current_evals=current_evals)
+
+    def _gather_island_best_scores(self) -> dict[str, float]:
+        """Per-island top score (direction-aware), used by score-weighted dest.
+
+        Iterates the on-disk island dirs (not specs) so the snapshot stays
+        correct after a resume reshuffles agents across islands via the
+        ``.coral_island`` breadcrumb.
+        """
+        assert self.paths is not None
+        results: dict[str, float] = {}
+        direction = self.config.grader.direction
+        islands_dir = self.paths.coral_dir / "islands"
+        if not islands_dir.exists():
+            return {}
+        for island_dir in sorted(islands_dir.iterdir()):
+            if not island_dir.is_dir():
+                continue
+            top = get_leaderboard(
+                self.paths.coral_dir,
+                top_n=1,
+                direction=direction,
+                island_id=island_dir.name,
+            )
+            if top and top[0].score is not None:
+                results[island_dir.name] = top[0].score
+        return results
+
+    def _select_executable_migration_batch(
+        self,
+        migrations: list[MigrationCandidate],
+    ) -> list[MigrationCandidate]:
+        """Apply the final per-cycle cap and roster-balance guard.
+
+        ``MigrationRunner.run_cycle`` already applies these rules to fresh
+        candidates, but manager-level deferred candidates are prepended after
+        that call. Re-run the final selection over the combined batch so
+        ``max_per_cycle`` remains the true execution cap.
+        """
+        if not migrations:
+            return []
+
+        max_per_cycle = self.migration_config.max_per_cycle
+        if not self._agent_island or self.paths is None:
+            return migrations[:max_per_cycle]
+
+        island_ids = self._migration_island_ids()
+        roster = IslandRoster.from_agent_islands(
+            self._agent_island,
+            island_ids=island_ids,
+        )
+        return choose_roster_balanced_subset(
+            migrations,
+            roster=roster,
+            max_per_cycle=max_per_cycle,
+            minimize=self.config.grader.direction == "minimize",
+        )
+
+    def _migration_island_ids(self) -> list[str]:
+        """Return configured island ids, preferring on-disk dirs when present."""
+        if self.paths is not None:
+            islands_dir = self.paths.coral_dir / "islands"
+            if islands_dir.exists():
+                ids = sorted(d.name for d in islands_dir.iterdir() if d.is_dir())
+                if ids:
+                    return ids
+        return [str(i) for i in range(self.config.islands.count)]
+
+    # --- Deferred-candidate bookkeeping ----------------------------------
+    #
+    # _apply_migration still has soft-fail exits (for example paused
+    # agents). The list below carries those soft-failed candidates across
+    # cycles so they get another shot at the top of the next run. Deferred
+    # batches retry indefinitely until they apply or become stale.
+
+    def _retry_deferred_migration_batch(self) -> bool:
+        """Retry a previously blocked migration batch outside the normal cadence.
+
+        Fresh migration selection is cadence-bound by ``migration.every``.
+        Retrying a batch that was already selected is not: if a candidate was
+        blocked by a temporary manager-side condition, the balanced swap
+        should apply as soon as that condition clears, not wait for another
+        full migration window.
+
+        Returns True when a deferred batch existed and was handled (applied,
+        re-deferred, or dropped), so callers should not also plan a fresh batch
+        in the same tick.
+        """
+        if not self._deferred_candidates:
+            return False
+        self._prune_deferred()
+        if not self._deferred_candidates:
+            return False
+        migrations = [candidate for candidate, _reason in self._deferred_candidates]
+        logger.info(f"Re-attempting deferred migration batch: {[c.agent_id for c in migrations]}")
+        self._apply_migration_batch(migrations, retry=True)
+        return True
+
+    def _apply_migration_batch(
+        self,
+        migrations: list[MigrationCandidate],
+        *,
+        current_evals: int | None = None,
+        retry: bool = False,
+    ) -> bool:
+        """Apply a planned migration batch only when every candidate is ready."""
+        if not migrations:
+            return False
+
+        blocked = [
+            (candidate, reason)
+            for candidate in migrations
+            if (reason := self._migration_block_reason(candidate)) is not None
+        ]
+        if blocked:
+            non_retriable = [
+                (candidate, reason)
+                for candidate, reason in blocked
+                if not self._migration_block_is_retriable(reason)
+            ]
+            if non_retriable:
+                for candidate, reason in non_retriable:
+                    self._handle_blocked_migration(candidate, reason)
+                self._deferred_candidates = []
+                logger.info("Dropping migration batch because it went stale")
+            else:
+                self._defer_migration_batch(migrations, blocked)
+                prefix = "Deferred migration batch retry"
+                if not retry:
+                    prefix = f"Migration cycle @ real eval#{current_evals}"
+                logger.info(
+                    f"{prefix}: deferring batch because {len(blocked)} candidate(s) are not ready"
+                )
+            return False
+
+        for candidate in migrations:
+            try:
+                self._apply_migration(candidate, assume_preflight=True)
+            except Exception as e:
+                logger.exception(
+                    f"Migration {candidate.agent_id} {candidate.src_island}→"
+                    f"{candidate.dst_island} failed: {e}"
+                )
+                return False
+        self._deferred_candidates = []
+        return True
+
+    def _migration_block_reason(self, candidate: MigrationCandidate) -> str | None:
+        """Return why ``candidate`` cannot safely migrate right now, if any."""
+        assert self.paths is not None
+
+        agent_id = candidate.agent_id
+        if not any(handle.agent_id == agent_id for handle in self.handles):
+            return "missing-handle"
+        if self._is_paused(agent_id):
+            return "paused"
+
+        current_island = self._agent_island.get(agent_id)
+        if current_island is not None and current_island != candidate.src_island:
+            return f"stale:{current_island}"
+
+        return None
+
+    @staticmethod
+    def _migration_block_is_retriable(reason: str) -> bool:
+        return reason == "paused"
+
+    @staticmethod
+    def _migration_defer_reason(reason: str) -> str:
+        if reason.startswith("stale:"):
+            return "stale"
+        return reason
+
+    def _defer_migration_batch(
+        self,
+        migrations: list[MigrationCandidate],
+        blocked: list[tuple[MigrationCandidate, str]],
+    ) -> None:
+        """Store the whole planned batch so retry preserves roster balance."""
+        blocked_reasons = {
+            candidate.agent_id: self._migration_defer_reason(reason)
+            for candidate, reason in blocked
+        }
+        self._deferred_candidates = [
+            (
+                candidate,
+                blocked_reasons.get(candidate.agent_id, "waiting-for-batch"),
+            )
+            for candidate in migrations
+        ]
+
+    def _handle_blocked_migration(self, candidate: MigrationCandidate, reason: str) -> None:
+        """Apply direct-call bookkeeping for a blocked single migration."""
+        agent_id = candidate.agent_id
+        if reason == "missing-handle":
+            logger.warning(f"Migration target {agent_id} has no live handle; skipping")
+            return
+        if reason == "paused":
+            logger.info(f"Migration target {agent_id} is paused; deferring")
+            self._defer_candidate(candidate, reason="paused")
+            return
+        if reason.startswith("stale:"):
+            current = reason.split(":", 1)[1]
+            logger.info(
+                f"Migration target {agent_id} no longer lives on island "
+                f"{candidate.src_island} (current: {current}); skipping stale candidate"
+            )
+            self._drop_deferred_for(agent_id)
+            return
+        logger.info(f"Migration target {agent_id} is blocked ({reason}); deferring")
+        self._defer_candidate(candidate, reason=reason)
+
+    def _filter_current_migration_candidates(
+        self,
+        migrations: list[MigrationCandidate],
+    ) -> list[MigrationCandidate]:
+        """Drop stale or duplicate migration candidates before applying them.
+
+        Old runs or interrupted migrations can leave attempt records on an
+        island after the agent has moved away. Do not let those stale records
+        move the same live agent twice in one cycle.
+        """
+        filtered: list[MigrationCandidate] = []
+        seen_agents: set[str] = set()
+        for candidate in migrations:
+            current = self._agent_island.get(candidate.agent_id)
+            if current is not None and current != candidate.src_island:
+                logger.info(
+                    f"Skipping stale migration candidate for {candidate.agent_id}: "
+                    f"planned from island {candidate.src_island}, currently on {current}"
+                )
+                continue
+            if candidate.agent_id in seen_agents:
+                logger.info(
+                    f"Skipping duplicate migration candidate for {candidate.agent_id} "
+                    f"in the same cycle"
+                )
+                continue
+            seen_agents.add(candidate.agent_id)
+            filtered.append(candidate)
+        return filtered
+
+    def _defer_candidate(
+        self,
+        candidate: MigrationCandidate,
+        *,
+        reason: str,
+    ) -> None:
+        """Add or bump a deferred candidate for retry on the next cycle."""
+        for i, (c, _r) in enumerate(self._deferred_candidates):
+            if c.agent_id == candidate.agent_id:
+                self._deferred_candidates[i] = (candidate, reason)
+                return
+        self._deferred_candidates.append((candidate, reason))
+
+    def _drop_deferred_for(self, agent_id: str) -> None:
+        """Remove any deferred entry for this agent (called on success)."""
+        self._deferred_candidates = [
+            (c, r) for c, r in self._deferred_candidates if c.agent_id != agent_id
+        ]
+
+    def _prune_deferred(self) -> None:
+        """Drop the deferred batch if any member went stale.
+
+        A deferred candidate is considered stale if the agent is no longer
+        on its recorded source island — meaning some other path (a fresh
+        cycle, a manual move) already moved them, and the deferred entry
+        would just fail again.
+        """
+        for candidate, _reason in self._deferred_candidates:
+            if self._agent_island.get(candidate.agent_id) != candidate.src_island:
+                logger.info(
+                    f"Dropping deferred migration batch because {candidate.agent_id} "
+                    f"no longer lives on island {candidate.src_island}"
+                )
+                self._deferred_candidates = []
+                return
+
+    def _apply_migration(
+        self, candidate: MigrationCandidate, *, assume_preflight: bool = False
+    ) -> None:
+        """Move ``candidate.agent_id`` from src island to dst, then restart it.
+
+        Sequence (each step intentionally idempotent on retry):
+
+        1. Skip if the agent is paused or stale. Pending grader attempts
+           are moved with the agent and finalized into the agent's current
+           island by the grader daemon.
+        2. Locate the live handle, SIGINT it so the runtime can save its
+           session and any in-flight file writes complete.
+        3. Move per-agent files (``roles/<agent>.md``,
+           ``heartbeat/<agent>.json``, attempts, and matching eval logs)
+           from src island to dst. Notes and skills stay on the source
+           island as island-local shared knowledge.
+        4. Repoint the worktree's shared-state symlinks at the dst island.
+        5. Re-write the runtime's permission settings with the new
+           island_id (so Read scopes follow the move).
+        6. Swap the in-memory ``AgentSpec`` + ``_agent_island`` entry so
+           later restarts honor the new home.
+        7. Drop an arrival note on dst (when ``notify_island=True``) so
+           teammates see the newcomer in ``coral notes --recent``.
+        8. Hand back to ``_setup_and_start_agent`` with the new island and
+           an "arrival" prompt summarising the move.
+        """
+        assert self.paths is not None
+
+        agent_id = candidate.agent_id
+        # (1) Locate handle, bail on missing / paused / pending agents.
+        if not assume_preflight:
+            reason = self._migration_block_reason(candidate)
+            if reason is not None:
+                self._handle_blocked_migration(candidate, reason)
+                return
+
+        idx: int | None = None
+        for i, handle in enumerate(self.handles):
+            if handle.agent_id == agent_id:
+                idx = i
+                break
+        if idx is None:
+            logger.warning(f"Migration target {agent_id} has no live handle; skipping")
+            return
+
+        src = candidate.src_island
+        dst = candidate.dst_island
+        current_island = self._agent_island.get(agent_id)
+        if current_island is not None and current_island != src:
+            logger.info(
+                f"Migration target {agent_id} no longer lives on island {src} "
+                f"(current: {current_island}); skipping stale candidate"
+            )
+            self._drop_deferred_for(agent_id)
+            return
+        coral_dir = self.paths.coral_dir
+        runtime = self._runtime_for(agent_id)
+        shared_dir_name = runtime.shared_dir_name
+        worktree_path = self.handles[idx].worktree_path
+
+        # Soft-fail gates passed — clear any prior deferral so a future
+        # cycle doesn't try to re-apply a candidate we already handled.
+        self._drop_deferred_for(agent_id)
+
+        # (2) Interrupt so file moves and symlink swaps happen with a quiet agent.
+        self.handles[idx].interrupt()
+        # Extract the session id BEFORE moves — same pattern the rest of
+        # the manager uses so the new process resumes the same session.
+        session_id = runtime.extract_session_id(self.handles[idx].log_path)
+
+        # (3) Move per-agent identity / cadence files src → dst.
+        _move_agent_files(coral_dir, agent_id, src=src, dst=dst)
+
+        # (4) Repoint worktree symlinks at dst.
+        repoint_shared_state(worktree_path, coral_dir, shared_dir_name, new_island_id=dst)
+
+        # (5) Re-write runtime permission settings against dst's island root.
+        gateway_url = self._gateway.url if self._gateway else None
+        gateway_api_key = self._gateway_keys.get(agent_id)
+        _refresh_runtime_settings(
+            worktree_path,
+            coral_dir=coral_dir,
+            shared_dir_name=shared_dir_name,
+            research=self.config.agents.research,
+            gateway_url=gateway_url,
+            gateway_api_key=gateway_api_key,
+            island_id=dst,
+        )
+
+        # (6) Swap spec + tracking dict so future restarts pick dst.
+        self._swap_spec_island(agent_id, new_island_id=dst)
+        self._agent_island[agent_id] = dst
+
+        # (7) Drop an arrival note on dst (best-effort).
+        if self.migration_config.notify_island:
+            try:
+                _write_arrival_note(coral_dir, candidate)
+            except OSError as e:
+                logger.warning(f"Failed to write arrival note for {agent_id}: {e}")
+
+        # Restart counter bump — this *is* a managed restart, surface it
+        # alongside the normal restart counters in `coral status`.
+        self._restart_counts[agent_id] = self._restart_counts.get(agent_id, 0) + 1
+        prompt = _build_migration_prompt(candidate, shared_dir=shared_dir_name)
+
+        logger.info(f"Migrated {agent_id}: island {src} → {dst} (score={candidate.score:.6f})")
+        if self.verbose:
+            print(
+                f"[coral] Migration: {agent_id} moved island {src} → {dst} "
+                f"(score={candidate.score:.6f})"
+            )
+
+        self.handles[idx] = self._setup_and_start_agent(
+            agent_id,
+            island_id=dst,
+            resume_session_id=session_id,
+            prompt=prompt,
+            prompt_source="migration",
+        )
+        self._write_agent_pids()
+
+    @property
+    def migration_config(self):
+        return self.config.islands.migration
+
+    def _swap_spec_island(self, agent_id: str, *, new_island_id: str) -> None:
+        """Replace the frozen AgentSpec for this agent with one pointing at new_island_id."""
+        for i, s in enumerate(self.specs):
+            if s.agent_id != agent_id:
+                continue
+            updated = AgentSpec(
+                agent_id=s.agent_id,
+                runtime=s.runtime,
+                model=s.model,
+                runtime_options=dict(s.runtime_options),
+                assignment_index=s.assignment_index,
+                island_id=new_island_id,
+            )
+            self.specs[i] = updated
+            self.specs_by_id[agent_id] = updated
+            return
+
     def monitor_loop(self, check_interval: int = 5) -> None:
         """Monitor agents, deliver eval feedback via --resume, auto-restart.
 
@@ -1247,7 +1876,16 @@ class AgentManager:
                         self._agent_eval_counts.get(committing_agent_id, 0) + 1
                     )
                     agent_eval_count = self._agent_eval_counts[committing_agent_id]
-                    global_eval_count = self._get_eval_count()
+                    # Per-agent eval count drives local heartbeat triggers; in
+                    # multi-island mode the "global" cadence reads the agent's
+                    # OWN island counter (each island has its own _global.json).
+                    island_id = self._agent_island.get(committing_agent_id)
+                    if island_id is not None:
+                        global_eval_count = read_eval_count(
+                            self.paths.coral_dir, island_id=island_id
+                        )
+                    else:
+                        global_eval_count = self._get_eval_count()
 
                     # Only "real" attempts advance plateau pressure. Tune-mode
                     # and grader_error attempts are recorded but don't trigger
@@ -1336,6 +1974,10 @@ class AgentManager:
                     )
                     self._write_agent_pids()
 
+            # Migration phase. Cheap when disabled (single-island mode or
+            # config off): should_run() short-circuits without scanning disk.
+            self._maybe_run_migration_cycle()
+
             # Check for dead agents (max-turns exit, crash, etc.)
             for i, handle in enumerate(self.handles):
                 if not handle.alive and self._running:
@@ -1408,9 +2050,17 @@ class AgentManager:
             # `agents.timeout == 0` disables the watchdog entirely.
             stall_threshold = self.config.agents.timeout
             if stall_threshold > 0:
-                # Cache pending attempts and the grader liveness once per tick
-                # so per-agent exemption checks do not rescan the attempts dir.
-                attempts_cache = read_attempts(self.paths.coral_dir)
+                # Cache pending attempts (per-island in multi-island, public in single)
+                # and the grader liveness once per tick so per-agent exemption checks
+                # do not rescan the attempts dir.
+                coral_dir = self.paths.coral_dir
+                if (coral_dir / "islands").exists():
+                    island_ids = {s.island_id for s in self.specs if s.island_id is not None}
+                    attempts_cache: list = []
+                    for iid in island_ids:
+                        attempts_cache.extend(read_attempts(coral_dir, island_id=iid))
+                else:
+                    attempts_cache = read_attempts(coral_dir)
                 grader_alive = self._grader_alive()
 
                 for i, handle in enumerate(self.handles):
@@ -1429,8 +2079,12 @@ class AgentManager:
                         # pending attempt has not aged past the cap (so a
                         # forgotten pending file cannot mask a true hang).
                         if grader_alive:
+                            island_id = self._agent_island.get(handle.agent_id)
                             pending = agent_in_grader_queue(
-                                self.paths.coral_dir, handle.agent_id, attempts_cache
+                                self.paths.coral_dir,
+                                handle.agent_id,
+                                attempts_cache,
+                                island_id=island_id,
                             )
                             if pending is not None:
                                 pending_age = self._attempt_age_seconds(pending.timestamp)
@@ -1617,3 +2271,251 @@ def _validate_sessions(
                 f"(different machine?), will start fresh"
             )
     return validated
+
+
+# ----------------------------------------------------------------------------
+# Migration helpers (module-level so they can be unit-tested independently)
+# ----------------------------------------------------------------------------
+
+
+def _move_agent_files(
+    coral_dir: Path,
+    agent_id: str,
+    *,
+    src: str,
+    dst: str,
+) -> None:
+    """Move per-agent identity files from one island to another.
+
+    Moves ``roles/<agent>.md`` and ``heartbeat/<agent>.json`` plus the
+    agent's attempt records and matching ``eval_logs/<commit>/`` directories.
+    Notes / skills deliberately stay on the source island as shared
+    island-local knowledge.
+
+    Idempotent: missing source files are silently skipped, so the helper
+    is safe to call twice on the same agent. Existing files at the
+    destination are overwritten — a second migration to the same dst
+    should win, not error.
+    """
+    src_root = island_root(coral_dir, src)
+    dst_root = island_root(coral_dir, dst)
+    for subdir, ext in (("roles", "md"), ("heartbeat", "json")):
+        src_path = src_root / subdir / f"{agent_id}.{ext}"
+        if not src_path.exists():
+            continue
+        dst_dir = dst_root / subdir
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        dst_path = dst_dir / f"{agent_id}.{ext}"
+        _move_path_replace(src_path, dst_path)
+
+    src_attempts = src_root / "attempts"
+    if not src_attempts.exists():
+        return
+    for attempt_path in sorted(
+        p for pattern in ("*.json", "*.jsonl") for p in src_attempts.glob(pattern)
+    ):
+        if not _attempt_file_belongs_to_agent(attempt_path, agent_id):
+            continue
+        dst_attempt = dst_root / "attempts" / attempt_path.name
+        dst_attempt.parent.mkdir(parents=True, exist_ok=True)
+        _move_path_replace(attempt_path, dst_attempt)
+        _stamp_attempt_file_island(dst_attempt, dst)
+
+        commit_hash = attempt_path.stem
+        src_eval_log = src_root / "eval_logs" / commit_hash
+        if src_eval_log.exists():
+            dst_eval_log = dst_root / "eval_logs" / commit_hash
+            dst_eval_log.parent.mkdir(parents=True, exist_ok=True)
+            _move_path_replace(src_eval_log, dst_eval_log)
+
+
+def _attempt_file_belongs_to_agent(path: Path, agent_id: str) -> bool:
+    """Return True when an attempt record file is owned by ``agent_id``."""
+    try:
+        text = path.read_text()
+    except OSError:
+        return False
+    if path.suffix == ".jsonl":
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                return False
+            if data.get("agent_id") != agent_id:
+                return False
+        return bool(text.strip())
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    return data.get("agent_id") == agent_id
+
+
+def _stamp_attempt_file_island(path: Path, island_id: str) -> None:
+    """Update a moved attempt record so later consumers see its current island."""
+    try:
+        if path.suffix == ".jsonl":
+            records = []
+            for line in path.read_text().splitlines():
+                if not line.strip():
+                    continue
+                data = json.loads(line)
+                metadata = data.get("metadata")
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                metadata["island_id"] = island_id
+                data["metadata"] = metadata
+                records.append(data)
+            path.write_text("".join(f"{json.dumps(record)}\n" for record in records))
+            return
+
+        data = json.loads(path.read_text())
+        metadata = data.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata["island_id"] = island_id
+        data["metadata"] = metadata
+        path.write_text(json.dumps(data, indent=2))
+    except (json.JSONDecodeError, OSError, TypeError) as e:
+        logger.warning("Failed to stamp migrated attempt %s with island %s: %s", path, island_id, e)
+
+
+def _move_path_replace(src_path: Path, dst_path: Path) -> None:
+    """Move a file or directory, replacing any existing destination."""
+    if dst_path.exists():
+        if dst_path.is_dir() and not dst_path.is_symlink():
+            shutil.rmtree(dst_path)
+        else:
+            dst_path.unlink()
+    # Cross-island within the same filesystem → rename is atomic.
+    # Fall back to copy + unlink if rename complains (e.g. across
+    # mount points in some test setups).
+    try:
+        os.replace(src_path, dst_path)
+    except OSError:
+        if src_path.is_dir():
+            shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
+            shutil.rmtree(src_path, ignore_errors=True)
+        else:
+            shutil.copy2(src_path, dst_path)
+            try:
+                src_path.unlink()
+            except OSError:
+                pass
+
+
+def _refresh_runtime_settings(
+    worktree_path: Path,
+    *,
+    coral_dir: Path,
+    shared_dir_name: str,
+    research: bool,
+    gateway_url: str | None,
+    gateway_api_key: str | None,
+    island_id: str,
+) -> None:
+    """Re-write the runtime's permission file against a new island root.
+
+    The Read scope baked into ``.claude/settings.local.json`` (and the
+    runtime equivalents) points at the agent's island root; after a
+    migration that scope must follow the worktree to the destination
+    island, otherwise the agent loses read access to its own newly-wired
+    notes / attempts.
+    """
+    if shared_dir_name == ".claude":
+        setup_claude_settings(
+            worktree_path,
+            coral_dir=coral_dir,
+            research=research,
+            gateway_url=gateway_url,
+            gateway_api_key=gateway_api_key,
+            island_id=island_id,
+        )
+    elif shared_dir_name == ".opencode":
+        setup_opencode_settings(
+            worktree_path,
+            coral_dir=coral_dir,
+            research=research,
+            gateway_url=gateway_url,
+            gateway_api_key=gateway_api_key,
+            island_id=island_id,
+        )
+    elif shared_dir_name == ".codex":
+        setup_codex_settings(
+            worktree_path,
+            coral_dir=coral_dir,
+            research=research,
+            gateway_url=gateway_url,
+            gateway_api_key=gateway_api_key,
+            island_id=island_id,
+        )
+    elif shared_dir_name == ".cursor":
+        setup_cursor_settings(
+            worktree_path,
+            coral_dir=coral_dir,
+            research=research,
+            gateway_url=gateway_url,
+            gateway_api_key=gateway_api_key,
+            island_id=island_id,
+        )
+
+
+def _write_arrival_note(coral_dir: Path, candidate: MigrationCandidate) -> None:
+    """Drop a markdown note on the destination island announcing the arrival.
+
+    The note carries ``creator: coral`` (not the migrating agent) so it
+    surfaces in ``coral notes --recent`` without polluting the
+    ``notes_by`` author lookups, which the framework uses to attribute
+    work back to specific agents.
+    """
+    notes_dir = island_root(coral_dir, candidate.dst_island) / "notes"
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(UTC)
+    fname_ts = now.strftime("%Y%m%dT%H%M%S")
+    body = (
+        f"---\n"
+        f"creator: coral\n"
+        f"created: {now.date().isoformat()}\n"
+        f"title: Migration arrival — {candidate.agent_id}\n"
+        f"---\n\n"
+        f"# Migration arrival: {candidate.agent_id}\n\n"
+        f"`{candidate.agent_id}` migrated to this island from "
+        f"island `{candidate.src_island}` with a recent best score of "
+        f"`{candidate.score:.6f}` over the last several real evals.\n\n"
+        f"They bring their evolved role, heartbeat cadence, attempts, "
+        f"and eval logs with them; notes and skills stay on island "
+        f"`{candidate.src_island}` as island-local shared knowledge.\n"
+    )
+    fname = f"migration_{fname_ts}_{candidate.agent_id}.md"
+    (notes_dir / fname).write_text(body)
+
+
+def _build_migration_prompt(candidate: MigrationCandidate, *, shared_dir: str) -> str:
+    """Resume prompt the migrated agent reads on its first wake-up."""
+    return (
+        f"## You have migrated to a new island\n\n"
+        f"You were doing well on island `{candidate.src_island}` "
+        f"(recent best `{candidate.score:.6f}`). The team selected you "
+        f"to seed island `{candidate.dst_island}`. Your worktree is now "
+        f"wired to that island's shared state.\n\n"
+        f"What changed:\n"
+        f"- `{shared_dir}/notes`, `{shared_dir}/skills`, "
+        f"`{shared_dir}/attempts`, `{shared_dir}/heartbeat`, "
+        f"`{shared_dir}/roles`, and `{shared_dir}/eval_logs` now resolve to island "
+        f"`{candidate.dst_island}`.\n"
+        f"- Your evolved role, heartbeat cadence, attempts, and eval logs "
+        f"followed you here.\n"
+        f"- Notes and skills stayed on island `{candidate.src_island}` as "
+        f"that island's shared knowledge base.\n\n"
+        f"What to do first:\n"
+        f"1. `coral log -n 10` to see this island's current leaderboard.\n"
+        f"2. `coral notes --recent` to read what your new teammates "
+        f"have been working on.\n"
+        f"3. `coral skills` to discover what tooling already exists "
+        f"here so you don't reinvent it.\n\n"
+        f"Then bring your strongest ideas from your previous run and "
+        f"adapt them to this island's frontier."
+    )

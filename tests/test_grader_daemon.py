@@ -715,3 +715,221 @@ def test_invalid_max_workers_rejected():
                 "grader": {"parallel": {"max_workers": 0}},
             }
         )
+
+
+def test_find_pending_multi_island_scans_every_island(tmp_path):
+    """_find_pending picks up attempts from every islands/<id>/attempts/ dir."""
+    from coral.grader.daemon import _find_pending
+    from coral.hub.attempts import write_attempt
+    from coral.types import Attempt
+
+    coral_dir = tmp_path / ".coral"
+    for i in range(3):
+        (coral_dir / "islands" / str(i) / "attempts").mkdir(parents=True)
+
+    a0 = Attempt(
+        commit_hash="aaa000",
+        agent_id="0-agent-1",
+        title="x",
+        score=None,
+        status="pending",
+        parent_hash=None,
+        timestamp="2026-05-31T10:00:00Z",
+        metadata={"island_id": "0"},
+    )
+    a1 = Attempt(
+        commit_hash="bbb111",
+        agent_id="1-agent-1",
+        title="y",
+        score=None,
+        status="pending",
+        parent_hash=None,
+        timestamp="2026-05-31T10:01:00Z",
+        metadata={"island_id": "1"},
+    )
+    write_attempt(coral_dir, a0, island_id="0")
+    write_attempt(coral_dir, a1, island_id="1")
+    pending = _find_pending(coral_dir)
+    hashes = {a.commit_hash for a in pending}
+    assert hashes == {"aaa000", "bbb111"}
+
+
+def test_grade_one_finalizes_migrated_pending_attempt_in_current_island(tmp_path, monkeypatch):
+    """If migration moves a pending attempt mid-grade, finalize into its current island."""
+    import coral.grader.daemon as daemon
+
+    coral_dir = tmp_path / ".coral"
+    for island in ("0", "1"):
+        (coral_dir / "islands" / island / "attempts").mkdir(parents=True)
+        (coral_dir / "islands" / island / "eval_logs").mkdir(parents=True)
+    (coral_dir / "public").mkdir(parents=True)
+
+    queued = Attempt(
+        commit_hash="abc123",
+        agent_id="0-agent-1",
+        title="queued before migration",
+        score=None,
+        status="pending",
+        parent_hash=None,
+        timestamp="2026-05-31T10:00:00Z",
+        metadata={"island_id": "0"},
+    )
+    write_attempt(coral_dir, queued, island_id="0")
+
+    moved = Attempt(
+        commit_hash="abc123",
+        agent_id="0-agent-1",
+        title="queued before migration",
+        score=None,
+        status="pending",
+        parent_hash=None,
+        timestamp="2026-05-31T10:00:00Z",
+        metadata={"island_id": "1"},
+    )
+    write_attempt(coral_dir, moved, island_id="1")
+    (coral_dir / "islands" / "0" / "attempts" / "abc123.json").unlink()
+    old_log = coral_dir / "islands" / "0" / "eval_logs" / "abc123" / "metrics.json"
+    old_log.parent.mkdir(parents=True)
+    old_log.write_text("{}")
+
+    config = CoralConfig.from_dict(
+        {
+            "task": {"name": "daemon_test", "description": "Daemon test"},
+            "grader": {"timeout": 60},
+            "agents": {"count": 1},
+        }
+    )
+    config_path = coral_dir / "config.yaml"
+    config_path.write_text("task:\n  name: daemon_test\n  description: Daemon test\n")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    class Bundle:
+        aggregated = 0.9
+        feedback = "ok"
+        metadata = {"grader_key": "grader_value"}
+        scores = {}
+
+    monkeypatch.setattr(daemon, "_repo_dir", lambda _coral_dir: repo)
+    monkeypatch.setattr(
+        daemon,
+        "_add_isolated_worktree",
+        lambda _repo_dir, _commit_hash, dest: dest.mkdir(parents=True, exist_ok=True),
+    )
+    monkeypatch.setattr(daemon, "_remove_worktree", lambda _repo_dir, _dest: None)
+    monkeypatch.setattr(daemon, "_run_grader_with_timeout", lambda *args, **kwargs: Bundle())
+
+    finalized = daemon._grade_one(queued, config_path, coral_dir, config)
+
+    assert finalized.status == "improved"
+    assert read_attempt(coral_dir, "abc123", island_id="0") is None
+    current = read_attempt(coral_dir, "abc123", island_id="1")
+    assert current is not None
+    assert current.score == 0.9
+    assert current.metadata["island_id"] == "1"
+    assert current.metadata["grader_key"] == "grader_value"
+    assert read_eval_count(coral_dir, island_id="0") == 0
+    assert read_eval_count(coral_dir, island_id="1") == 1
+    assert read_eval_count(coral_dir) == 1
+    assert not (coral_dir / "islands" / "0" / "eval_logs" / "abc123").exists()
+    assert (coral_dir / "islands" / "1" / "eval_logs" / "abc123" / "metrics.json").exists()
+
+
+def test_find_pending_single_island_unchanged(tmp_path):
+    """Single-island: _find_pending scans only public/attempts/."""
+    from coral.grader.daemon import _find_pending
+    from coral.hub.attempts import write_attempt
+    from coral.types import Attempt
+
+    coral_dir = tmp_path / ".coral"
+    (coral_dir / "public" / "attempts").mkdir(parents=True)
+
+    a = Attempt(
+        commit_hash="ccc",
+        agent_id="agent-1",
+        title="x",
+        score=None,
+        status="pending",
+        parent_hash=None,
+        timestamp="2026-05-31T10:00:00Z",
+    )
+    write_attempt(coral_dir, a)
+    pending = _find_pending(coral_dir)
+    assert {p.commit_hash for p in pending} == {"ccc"}
+
+
+# --- _append_eval_logs_hint: universal trace-log footer --------------------
+#
+# Regression: agent attempt e90ca6c3 timed out, feedback was just
+# "Evaluation timed out after 1200s" with no eval_logs path. The agent had
+# no way to find their trajectory/recording. The daemon now appends a footer
+# on every feedback path (success, timeout, crashed) so the agent always
+# knows where to look.
+
+
+def test_append_eval_logs_hint_includes_worktree_relative_path():
+    """Footer must contain the worktree-relative form (runtime-agnostic)."""
+    from coral.grader.daemon import _append_eval_logs_hint
+
+    out = _append_eval_logs_hint("Eval timed out.", "deadbeef1234", "claude_code")
+
+    assert "deadbeef1234" in out
+    assert "eval_logs/deadbeef1234/" in out
+
+
+def test_append_eval_logs_hint_includes_concrete_shared_dir_path():
+    """Footer must also show the concrete `.claude/` form so the agent
+    doesn't have to guess what "shared state dir" means."""
+    from coral.grader.daemon import _append_eval_logs_hint
+
+    out = _append_eval_logs_hint("", "abc1234", "claude_code")
+
+    assert ".claude/eval_logs/abc1234/" in out
+
+
+def test_append_eval_logs_hint_preserves_original_feedback():
+    """The original feedback (e.g. "Eval timed out after 1200s") must come
+    first, footer second. No silent replacement."""
+    from coral.grader.daemon import _append_eval_logs_hint
+
+    original = "Evaluation timed out after 1200s"
+    out = _append_eval_logs_hint(original, "h1", "claude_code")
+
+    assert out.startswith(original)
+    assert "### Trace logs" in out
+
+
+def test_append_eval_logs_hint_handles_empty_feedback():
+    """A blank feedback (rare but possible from a crashed grader that raised
+    an empty exception) must still get the footer."""
+    from coral.grader.daemon import _append_eval_logs_hint
+
+    out = _append_eval_logs_hint("", "h1", "claude_code")
+
+    assert "eval_logs/h1/" in out
+
+
+def test_append_eval_logs_hint_uses_correct_shared_dir_per_runtime():
+    """For other runtimes, the concrete path uses the matching shared dir
+    (.codex, .opencode, .kiro). Verified via the registry path; the fallback
+    map mirrors shared_dir_name in coral/agent/builtin/*."""
+    from coral.grader.daemon import _append_eval_logs_hint
+
+    for runtime, expected in [
+        ("claude_code", ".claude"),
+        ("codex", ".codex"),
+        ("opencode", ".opencode"),
+        ("kiro", ".kiro"),
+    ]:
+        out = _append_eval_logs_hint("", "h1", runtime)
+        assert f"{expected}/eval_logs/h1/" in out, f"{runtime} should produce {expected}/ path"
+
+
+def test_append_eval_logs_hint_unknown_runtime_falls_back_to_claude():
+    """A typo'd or custom runtime name shouldn't crash — fall back to .claude."""
+    from coral.grader.daemon import _append_eval_logs_hint
+
+    out = _append_eval_logs_hint("feedback", "h1", "totally-made-up-runtime")
+
+    assert ".claude/eval_logs/h1/" in out
+    assert "feedback" in out  # original preserved
