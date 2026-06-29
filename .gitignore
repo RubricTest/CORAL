@@ -97,3 +97,7 @@ examples/frontier_cs_research/task_dynamic.yaml
 examples/apex-frontier
 examples/apex-prelim
 examples/deepresearch_bench
+
+# Local RL env-selection scratch data
+/auto_rl_selection/data/
+/auto_rl_selection/.ostest_venv/

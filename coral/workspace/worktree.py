@@ -434,6 +434,19 @@ def setup_claude_settings(
 
     settings: dict = {
         "permissions": permissions,
+        # OS-level (bubblewrap on Linux / Seatbelt on macOS) read block over the
+        # private dir. The `Read(/private/**)` deny only governs Claude's file
+        # tools and the file commands it recognizes (cat/head/tail/sed) — it does
+        # NOT stop arbitrary subprocesses (e.g. `python -c "open(...).read()"`).
+        # The sandbox closes that bypass so grader internals / answer keys under
+        # .coral/private/ stay unreadable from the Bash tool. Mirrors the
+        # `bash: {private: deny}` rule already present for the OpenCode runtime.
+        # Falls back gracefully (with a warning) if the sandbox backend is
+        # unavailable on the host; install bubblewrap for enforcement.
+        "sandbox": {
+            "enabled": True,
+            "filesystem": {"denyRead": [f"/{private_pattern}"]},
+        },
     }
 
     # Route agent traffic through gateway by overriding env in settings.

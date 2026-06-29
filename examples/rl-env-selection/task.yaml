@@ -1,0 +1,89 @@
+task:
+  name: "RL Environment Selection"
+  description: |
+    From a pool of 4,459 SWE RL environments (each a `task = repo:commit_hash`),
+    score every environment by how useful it is to KEEP for RL training. The goal
+    is a STATIC selection (no per-RL-step dynamics): pick a high-value subset so a
+    fixed training budget retains the most learning signal.
+
+    **Ground truth (hidden).** From a full 181-step GRPO run, each environment has
+    an empirical base pass rate `p_i`. With GRPO group size 8, a group yields a
+    non-zero advantage only when it is neither all-pass nor all-fail, so the
+    per-step expected learning-signal probability is:
+
+        v_i = 1 - p_i^8 - (1 - p_i)^8        # 0 at p=0 or 1, ≈1 at p≈0.5
+
+    The hidden GT (`v_i`, `p_i`, keep label) lives inside the grader package and is
+    NEVER exposed. You only get INPUT fields per environment.
+
+    **Your program** (`solution.py`) must define:
+
+        run(inputs_path: str) -> dict[str, float]
+
+    - `inputs_path`: a JSONL file; each line is one environment's INPUT record with
+      keys: `task, repo, commit_hash, docker_image, data_source, ability,
+      problem_statement, prompt`. (A full copy of all 4,459 inputs is in
+      `data/task_env_inputs.jsonl`; the grader passes the eval-split subset.)
+    - returns `{task: score}` — higher score = keep. Any real number; only the
+      ranking matters. Omitted tasks rank last.
+
+    **Metric (maximize): mSR** — mean Signal Retention over all budgets N, in [0,1]:
+
+        SR@N = Σ_{top-N by your score} v_i  /  Σ_{top-N by v} v_i
+        mSR  = (1/T) Σ_{N=1..T} SR@N
+
+    Honest baselines: random ≈ 0.60, repo-prior ≈ 0.65, oracle (= GT order) = 1.0.
+    The room to win is ~0.65 → 1.0; repo-level features cap out near 0.65, so you
+    must distinguish environments WITHIN a repo.
+
+    **Rules.** You may use any input feature (problem_statement, prompt, repo,
+    docker_image, ...) and may **explore** the repo by spinning up `docker_image`
+    (inspect files/tests/structure) to build predictive features. You must NOT use
+    any ground-truth pass rate / reward / test oracle — those are hidden. The goal
+    is to PREDICT learnability cheaply, not to measure it by solving the task.
+
+  tips: |
+    - Start from the placeholder in `solution.py` (problem_statement length) and
+      beat repo-prior (~0.65 mSR).
+    - The eval split is `dev500` by default (a nested, distribution-matched subset:
+      dev100 ⊂ dev300 ⊂ dev500 ⊂ dev1000 ⊂ full). dev100/dev300 are noisier.
+    - `v_i` peaks at p≈0.5: you want environments that are neither trivially solved
+      nor impossible for the base model. Think "learnability", not raw difficulty.
+    - Spearman(score, v) and keepF1 are reported alongside mSR for diagnosis.
+    - To explore a repo, spin up its `docker_image` with the provided
+      `env_explore.py` (OpenSandbox helper: start/exec/read_file/stop; auto-prefixes
+      the internal registry). Inspect files/tests/structure to build features —
+      this is exploration, not solving. Optionally drive mini-swe-agent to explore
+      autonomously. See `BENCHMARK.md` → "Exploring an environment". Sandboxes are
+      limited — sample, cache, always tear down.
+    - See `BENCHMARK.md` in the seed for the full spec.
+
+grader:
+  entrypoint: "rl_env_selection_grader.grader:Grader"
+  setup:
+    - "uv pip install -e ./grader"
+  # Hidden ground truth — copied into .coral/private/gt/, never inside the
+  # grader package, so the agent cannot recover answers by locating the
+  # (editable-installed) grader source. Covered by the agent Read deny + sandbox.
+  private:
+    - "gt"
+  timeout: 600
+  direction: maximize
+  args:
+    program_file: "solution.py"
+    inputs_file: "data/task_env_inputs.jsonl"
+    split: "dev500"
+
+agents:
+  count: 4
+  runtime: claude_code
+  model: opus
+
+workspace:
+  results_dir: "./results"
+  repo_path: "./rl-env-selection/repo"
+
+run:
+  verbose: false
+  ui: false
+  session: tmux
