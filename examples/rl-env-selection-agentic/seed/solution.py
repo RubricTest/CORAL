@@ -1,15 +1,17 @@
 """Agentic baseline for the RL environment selection task.
 
 Goal: score each SWE RL environment by how useful it is to KEEP for training.
-Higher score = more likely to keep. You are evaluated by mSR (mean Signal
-Retention) against a hidden ground-truth value v_i; see CORAL.md / BENCHMARK.md.
+Higher score = more likely to keep. The PRIMARY metric is AUROC of your score
+against the keep/drop label (keep = 0<p<1); AP, mSR (on v=p(1-p)) and Spearman are
+secondary. See CORAL.md / BENCHMARK.md.
 
 This variant gives you a **callable model** (an OpenAI-compatible gateway) so you
 can build an LLM-judge / multi-subagent *pipeline* instead of a hand-written
 feature. `llm_client.LLMClient` fans out one "subagent" call per environment in
 parallel (`.map(...)`) — each call rates how *learnable* an environment looks for
-the base model (you want p≈0.5: neither trivially solved nor impossible, since
-v_i = 1 - p^8 - (1-p)^8 peaks at p=0.5).
+the base model. What AUROC rewards most is confidently separating environments the
+base model ALWAYS solves (p=1, trivial) or NEVER solves (p=0, dead) from the
+learnable middle; v_i = p(1-p) then ranks within that middle (peaks at p=0.5).
 
 Contract:
     run(inputs_path: str) -> dict[str, float]
@@ -66,8 +68,8 @@ def _parse_pass_pct(reply: str) -> float | None:
 
 
 def _learnability(p: float) -> float:
-    """v_i = 1 - p^8 - (1-p)^8 — the GRPO learning-signal value (peaks at p=0.5)."""
-    return 1.0 - p**8 - (1.0 - p) ** 8
+    """v_i = p(1-p) — GRPO reward variance, the learning-signal value (peaks at p=0.5)."""
+    return p * (1.0 - p)
 
 
 def run(inputs_path: str) -> dict[str, float]:

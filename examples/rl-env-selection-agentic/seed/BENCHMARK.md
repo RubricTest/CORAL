@@ -30,31 +30,38 @@ def run(inputs_path: str) -> dict[str, float]:
 
 ## Ground truth (hidden) & metric
 
-From a full 181-step GRPO run each env has an empirical base pass rate `p_i`.
-GRPO group size = 8 ⇒ a group gives non-zero advantage only if not all-pass and
-not all-fail, so the per-step expected learning-signal value is:
+From a full 181-step GRPO run each env has an empirical base pass rate `p_i`. The
+task splits into two sub-problems, scored separately:
+
+- **keep/drop**: `keep_i = 1 iff 0 < p_i < 1`. p=0 (never solved → dead) and p=1
+  (always solved → trivial) yield no GRPO advantage and should be dropped.
+- **fine ranking** within the learnable set, by reward variance (peaks at p=0.5):
+
+  ```
+  v_i = p_i (1 - p_i)        # 0 at p∈{0,1}, max 0.25 at p≈0.5
+  ```
+
+**Primary metric — AUROC (maximize), in [0,1]:** area under the ROC curve of your
+score vs the binary keep label. Random = **0.50**, perfect separation = **1.0**.
+It is the *returned* score and is robust to the coarse `p` estimate (n=8..24/env).
+
+**Secondary (reported, not returned):**
 
 ```
-v_i = 1 - p_i^8 - (1 - p_i)^8        # 0 at p∈{0,1}, ≈1 at p≈0.5
+AP        = average precision (area under PR) for keep=1; random ≈ keep prevalence (~0.56)
+SR@N      = Σ_{top-N by your score} v_i / Σ_{top-N by v} v_i        # signal retained at budget N
+mSR       = (1/T) Σ_{N=1..T} SR@N                                   # over v=p(1-p)
+Spearman(score, v), SR@25/50/75%
 ```
 
-**Primary metric — mSR (maximize), in [0,1]:**
-
-```
-SR@N = Σ_{top-N by your score} v_i  /  Σ_{top-N by v} v_i      # signal retained at budget N
-mSR  = (1/T) Σ_{N=1..T} SR@N                                   # averaged over all budgets
-```
-
-Reported alongside: `SR@25/50/75%`, `Spearman(score, v)`, `keepF1` (at the
-keep/drop budget). Honest baselines: **random ≈ 0.60, repo-prior ≈ 0.65,
-oracle = 1.0**. repo-level features cap near 0.65 (Spearman≈0.12) — the win is in
-distinguishing environments **within** a repo.
+AUROC's fixed 0.50 baseline is identical across all splits, so gains are directly
+comparable; AP/mSR/Spearman grade the noisier within-learnable ordering.
 
 ## Eval splits (nested, distribution-matched)
 
 `dev100 ⊂ dev300 ⊂ dev500 ⊂ dev1000 ⊂ full`. Default eval = `dev500`. Each is
-stratified by `repo × difficulty` so mSR on a split tracks full. dev100/dev300 are
-noisier (smoke tests); report on dev500+ / full. The eval split is fixed by the
+stratified by `repo × difficulty` so the metric on a split tracks full. dev100/dev300
+are noisier (smoke tests); report on dev500+ / full. The eval split is fixed by the
 grader (`task.yaml: grader.args.split`); you cannot pick your own subset.
 
 ## Rules (anti-leak)

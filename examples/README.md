@@ -304,7 +304,7 @@ The same task and grader as `rl-env-selection`, but the agent is given a **calla
 
 - **Agents**: 4
 - **Timeout**: 600s
-- **Scoring**: identical to `rl-env-selection` (mSR)
+- **Scoring**: **AUROC** of the score vs the keep/drop label (primary, returned); AP, mSR on `v=p(1-p)`, and Spearman reported as secondary. (Differs from `rl-env-selection`, which uses mSR on `v=1-p^8-(1-p)^8`.)
 - **Model**: configured via env vars the grader subprocess inherits from your `coral start` shell — `CORAL_LLM_BASE_URL`, `CORAL_LLM_API_KEY`, `CORAL_LLM_MODEL` (falls back to the standard `OPENAI_*` names). If unset, `solution.py` degrades to a cheap heuristic so the run still grades.
 - **Usage**:
   ```bash

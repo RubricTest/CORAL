@@ -3,13 +3,21 @@
 The agent writes ``solution.py`` defining ``run(inputs_path) -> dict[str, float]``
 that maps each environment ``task`` (``repo:commit_hash``) to a *keep score*
 (higher = should keep for RL training). The grader runs it on a fixed eval split
-(input-only records) and scores the ranking against the hidden ground-truth value
-``v_i = 1 - p_i^8 - (1-p_i)^8`` (expected per-step GRPO learning-signal probability).
+(input-only records) and scores it against the hidden empirical pass rate ``p_i``.
 
-Primary metric: **mSR** (mean Signal Retention over all budgets N), in [0, 1].
-    SR@N = Σ_{top-N by method} v_i  /  Σ_{top-N by v} v_i
-    mSR  = (1/T) Σ_{N=1..T} SR@N
-Honest baselines: random ≈ 0.60, repo-prior ≈ 0.65, oracle (= GT order) = 1.0.
+The task splits into two sub-problems; we score them separately:
+
+  * **Primary — keep/drop separation (AUROC).** ``keep_i = 1 iff 0 < p_i < 1``
+    (a dead env at p=0 or a trivial env at p=1 yields no GRPO signal). AUROC of
+    the score against this binary label is robust to the coarse p estimate
+    (n=8..24 samples/env). Random = 0.50, perfect separation = 1.0. **This is the
+    returned score.** Reported alongside: **AP** (average precision, area under PR;
+    random baseline ≈ keep prevalence ≈ 0.56).
+
+  * **Secondary — continuous learnability ranking (mSR).** Learnability value is
+    the GRPO reward variance ``v_i = p_i (1 - p_i)`` (smooth, peaks at p=0.5),
+    NOT the old saturated ``1 - p_i^8 - (1-p_i)^8``. mSR = mean over budgets N of
+    ``SR@N = Σ_{top-N by method} v_i / Σ_{top-N by v} v_i``. Spearman(score, v) too.
 
 The ground truth (v / p / keep) is delivered via ``grader.private`` into
 ``.coral/private/gt/`` (read here through ``self.private_dir``) — NOT shipped
@@ -45,7 +53,11 @@ def _load_gt(split: str, gt_dir: Path) -> dict[str, dict]:
     gt: dict[str, dict] = {}
     with open(path) as f:
         for r in csv.DictReader(f):
-            gt[r["task"]] = {"v": float(r["v"]), "keep": int(r["keep"])}
+            # Learnability value = reward variance p(1-p) (smooth, peaks at p=0.5).
+            # Derived from the empirical pass rate p; the stale `v` column in the
+            # CSV (the old 1-p^8-(1-p)^8) is intentionally ignored.
+            p = float(r["p"])
+            gt[r["task"]] = {"v": p * (1.0 - p), "p": p, "keep": int(r["keep"])}
     return gt
 
 
@@ -74,15 +86,68 @@ def _spearman(xs: list[float], ys: list[float]) -> float:
     return num / den if den else 0.0
 
 
+def _auroc(labels: list[int], xs: list[float]) -> float:
+    """AUROC for the keep/drop binary label via the Mann-Whitney U statistic.
+
+    Tie-aware (average ranks), so it does not depend on any tie-break ordering.
+    Returns nan if a class is empty. Random=0.5, perfect separation=1.0.
+    """
+    n = len(xs)
+    order = sorted(range(n), key=lambda i: xs[i])
+    rk = [0.0] * n
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and xs[order[j + 1]] == xs[order[i]]:
+            j += 1
+        avg = (i + j) / 2.0 + 1  # 1-based average rank for the tie block
+        for k in range(i, j + 1):
+            rk[order[k]] = avg
+        i = j + 1
+    n_pos = sum(labels)
+    n_neg = n - n_pos
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    sum_ranks_pos = sum(rk[i] for i in range(n) if labels[i] == 1)
+    return (sum_ranks_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+
+
+def _average_precision(method: list[str], gt: dict[str, dict]) -> float:
+    """Average Precision (area under PR) for keep=1, walking the ranked list.
+
+    AP = mean over positives of precision@(rank of that positive). The unbiased
+    estimator (no trapezoidal PR interpolation). Random baseline ≈ prevalence.
+    """
+    n_pos = sum(gt[t]["keep"] for t in method)
+    if n_pos == 0:
+        return float("nan")
+    tp = 0
+    ap = 0.0
+    for rank, t in enumerate(method, 1):
+        if gt[t]["keep"] == 1:
+            tp += 1
+            ap += tp / rank
+    return ap / n_pos
+
+
 def _score_ranking(gt: dict[str, dict], scores: dict[str, float]) -> dict:
-    """Compute mSR + auxiliaries from a {task: score} mapping vs hidden GT."""
+    """Compute AUROC (primary) + AP + mSR(v=p(1-p)) + Spearman vs hidden GT."""
     tasks = list(gt)
     # GT-independent deterministic tie-break: a constant-score method can't shortcut.
     def tb(t):
         return hashlib.md5(t.encode()).hexdigest()
 
     method = sorted(tasks, key=lambda t: (-scores.get(t, float("-inf")), tb(t)))
+    n = len(tasks)
+    K = sum(gt[t]["keep"] for t in tasks)
 
+    # --- Primary: keep/drop separation (AUROC), secondary AP --------------
+    xs = [scores.get(t, float("-inf")) for t in tasks]
+    labels = [gt[t]["keep"] for t in tasks]
+    auroc = _auroc(labels, xs)
+    ap = _average_precision(method, gt)
+
+    # --- Secondary: continuous learnability ranking, v = p(1-p) ------------
     v_sorted = sorted((gt[t]["v"] for t in tasks), reverse=True)
     opt_cum = [0.0]
     for v in v_sorted:
@@ -90,24 +155,24 @@ def _score_ranking(gt: dict[str, dict], scores: dict[str, float]) -> dict:
     m_cum = [0.0]
     for t in method:
         m_cum.append(m_cum[-1] + gt[t]["v"])
-    n = len(tasks)
 
     def SR(k):
         return m_cum[k] / opt_cum[k] if opt_cum[k] > 0 else 1.0
 
     mSR = sum(SR(k) for k in range(1, n + 1)) / n
     sr_q = {q: SR(max(1, round(n * q))) for q in (0.25, 0.5, 0.75)}
+    rho = _spearman(xs, [gt[t]["v"] for t in tasks])
 
-    xs = [scores.get(t, float("-inf")) for t in tasks]
-    ys = [gt[t]["v"] for t in tasks]
-    rho = _spearman(xs, ys)
-
-    K = sum(gt[t]["keep"] for t in tasks)
-    pred_keep = set(method[:K])
-    tp = sum(1 for t in pred_keep if gt[t]["keep"] == 1)
-    f1 = tp / K if K else 0.0  # precision == recall == F1 at fixed K
-
-    return {"mSR": mSR, "sr_q": sr_q, "spearman": rho, "keepF1": f1, "n": n, "missing": sum(1 for t in tasks if t not in scores)}
+    return {
+        "auroc": auroc,
+        "ap": ap,
+        "mSR": mSR,
+        "sr_q": sr_q,
+        "spearman": rho,
+        "keep_prevalence": K / n if n else 0.0,
+        "n": n,
+        "missing": sum(1 for t in tasks if t not in scores),
+    }
 
 
 class Grader(TaskGrader):
@@ -176,14 +241,15 @@ class Grader(TaskGrader):
         res = _score_ranking(gt, scores)
         q = res["sr_q"]
         explanation = (
-            f"mSR={res['mSR']:.4f} on split={split} (N={res['n']}) | "
-            f"SR@25%={q[0.25]:.3f} SR@50%={q[0.5]:.3f} SR@75%={q[0.75]:.3f} | "
-            f"Spearman={res['spearman']:.3f} keepF1={res['keepF1']:.3f} | "
-            f"baselines: random≈0.60 repo-prior≈0.65 oracle=1.0"
+            f"AUROC={res['auroc']:.4f} on split={split} (N={res['n']}, keep_prev={res['keep_prevalence']:.3f}) | "
+            f"AP={res['ap']:.4f} | "
+            f"mSR={res['mSR']:.4f} [v=p(1-p)] SR@25%={q[0.25]:.3f} SR@50%={q[0.5]:.3f} SR@75%={q[0.75]:.3f} | "
+            f"Spearman={res['spearman']:.3f} | "
+            f"baselines — AUROC: random=0.50 oracle=1.0; AP: random≈keep_prev"
         )
         if res["missing"]:
             explanation += f" | [warn] {res['missing']} eval tasks unscored (treated as last)"
-        return self.score(res["mSR"], explanation)
+        return self.score(res["auroc"], explanation)
 
 
 def _run_solution(program_path: str, inputs_path: str, timeout: int, python_cmd: list[str]) -> dict:

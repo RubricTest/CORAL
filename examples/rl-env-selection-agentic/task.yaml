@@ -7,14 +7,15 @@ task:
     fixed training budget retains the most learning signal.
 
     **Ground truth (hidden).** From a full 181-step GRPO run, each environment has
-    an empirical base pass rate `p_i`. With GRPO group size 8, a group yields a
-    non-zero advantage only when it is neither all-pass nor all-fail, so the
-    per-step expected learning-signal probability is:
+    an empirical base pass rate `p_i`. A group gives a non-zero GRPO advantage only
+    when it is neither all-pass nor all-fail, so the per-environment learning-signal
+    value is the reward variance (peaks at p=0.5):
 
-        v_i = 1 - p_i^8 - (1 - p_i)^8        # 0 at p=0 or 1, ≈1 at p≈0.5
+        v_i = p_i (1 - p_i)                  # 0 at p=0 or 1, max 0.25 at p=0.5
 
-    The hidden GT (`v_i`, `p_i`, keep label) lives inside the grader package and is
-    NEVER exposed. You only get INPUT fields per environment.
+    and the keep/drop label is `keep_i = 1 iff 0 < p_i < 1` (p=0 → dead, p=1 →
+    trivial; both yield no signal). The hidden GT (`p_i`, `v_i`, keep) lives inside
+    the grader and is NEVER exposed. You only get INPUT fields per environment.
 
     **Your program** (`solution.py`) must define:
 
@@ -27,14 +28,18 @@ task:
     - returns `{task: score}` — higher score = keep. Any real number; only the
       ranking matters. Omitted tasks rank last.
 
-    **Metric (maximize): mSR** — mean Signal Retention over all budgets N, in [0,1]:
+    **Metric (maximize): AUROC** — area under the ROC curve of your score against
+    the binary keep/drop label. This is the PRIMARY, returned score: how well you
+    separate learnable environments (0<p<1) from dead/trivial ones. Random = 0.50,
+    perfect separation = 1.0; robust to the coarse p estimate (n=8..24/env).
 
-        SR@N = Σ_{top-N by your score} v_i  /  Σ_{top-N by v} v_i
-        mSR  = (1/T) Σ_{N=1..T} SR@N
-
-    Honest baselines: random ≈ 0.60, repo-prior ≈ 0.65, oracle (= GT order) = 1.0.
-    The room to win is ~0.65 → 1.0; repo-level features cap out near 0.65, so you
-    must distinguish environments WITHIN a repo.
+    Reported alongside (secondary, not the returned score):
+    - **AP** — average precision (area under PR) for keep=1; random ≈ keep
+      prevalence (~0.56).
+    - **mSR** — mean Signal Retention over all budgets N, using the continuous
+      value `v_i = p_i(1-p_i)`:  SR@N = Σ_{top-N by your score} v_i / Σ_{top-N by v}
+      v_i;  mSR = mean_N SR@N. Plus Spearman(score, v). These measure fine ranking
+      WITHIN the learnable set, which is noisier than the keep/drop call.
 
     **Callable model (this variant).** You are given an OpenAI-compatible model
     gateway you can call from `solution.py` — use it to build an LLM-judge /
@@ -60,17 +65,20 @@ task:
 
   tips: |
     - The seed `solution.py` is an LLM-judge pipeline: it asks the provided model
-      for each environment's base pass probability and maps it through
-      v = 1 - p^8 - (1-p)^8. Beat repo-prior (~0.65 mSR) and iterate the prompt /
+      for each environment's base pass probability `p` and maps it through
+      v = p(1-p). For the PRIMARY metric (AUROC) what matters is separating
+      learnable (0<p<1) from dead/trivial (p∈{0,1}) — i.e. confidently flagging
+      the environments the base model ALWAYS or NEVER solves. Iterate the prompt /
       add features (repo, code structure from env_explore.py) on top.
     - Use `llm_client.LLMClient().map(prompts, max_workers=16)` to fan out calls in
       parallel — that is the "subagent" pipeline. Keep `max_tokens` small and cache
       where you can; the eval split has up to 1000 environments.
     - The eval split is `dev500` by default (a nested, distribution-matched subset:
       dev100 ⊂ dev300 ⊂ dev500 ⊂ dev1000 ⊂ full). dev100/dev300 are noisier.
-    - `v_i` peaks at p≈0.5: you want environments that are neither trivially solved
-      nor impossible for the base model. Think "learnability", not raw difficulty.
-    - Spearman(score, v) and keepF1 are reported alongside mSR for diagnosis.
+    - `v_i = p(1-p)` peaks at p≈0.5: among the learnable set, value those neither
+      trivially solved nor impossible. Think "learnability", not raw difficulty.
+    - AP, mSR (on v=p(1-p)) and Spearman(score, v) are reported alongside AUROC for
+      diagnosis — AUROC is the keep/drop call, the rest grade fine ranking.
     - To explore a repo, spin up its `docker_image` with the provided
       `env_explore.py` (OpenSandbox helper: start/exec/read_file/stop; auto-prefixes
       the internal registry). Inspect files/tests/structure to build features —
