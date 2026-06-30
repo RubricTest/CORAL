@@ -154,6 +154,8 @@ uv pip install -e ./examples/drug_design/grader[ml]
 | [drug_design](#drug_design) | Design novel small-molecule antibiotics (SAGA) | Maximize |
 | [swebench-verified](#swebench-verified) | Optimize a solver program across 500 SWE-bench instances | Maximize |
 | [terminal-bench](#terminal-bench) | Optimize a solver agent for terminal/shell tasks | Maximize |
+| [rl-env-selection](#rl-env-selection) | Score 4,459 SWE RL environments by learnability to keep the best subset (mSR) | Maximize |
+| [rl-env-selection-agentic](#rl-env-selection-agentic) | Same task, with a callable model gateway for building an LLM-judge pipeline | Maximize |
 
 ## Details
 
@@ -285,6 +287,32 @@ Meta-solver optimization: agents improve a `solve.py` that wraps a Terminus2-bas
 - **Setup**: `uv pip install anthropic`; requires Harbor CLI (`uvx harbor`)
 - **Baseline**: Terminus2 agent architecture (tmux-based multi-turn interaction)
 - **Note**: Harbor runs Docker containers, so CORAL must run on the host (no Docker-in-Docker)
+
+### rl-env-selection
+
+Score each of 4,459 SWE RL environments (`task = repo:commit_hash`) by how useful it is to **keep** for RL training, as a static selection (no per-step dynamics). The agent writes `solution.py` defining `run(inputs_path) -> {task: score}` (higher = keep); the grader ranks it against a hidden ground-truth learning-signal value `v_i = 1 - p_i^8 - (1-p_i)^8` (peaks at base pass rate `p≈0.5`). The win is distinguishing environments *within* a repo — repo-level features cap near repo-prior.
+
+- **Agents**: 4
+- **Timeout**: 600s
+- **Scoring**: mSR (mean Signal Retention over all budgets), in [0,1]. Baselines: random ≈ 0.60, repo-prior ≈ 0.65, oracle = 1.0
+- **Hidden data**: ground truth (`v`, `p`, keep label) shipped via `grader.private` into `.coral/private/gt/`, never inside the package
+- **Exploration**: `seed/env_explore.py` spins up each `docker_image` via OpenSandbox to build predictive features (no oracle access)
+
+### rl-env-selection-agentic
+
+The same task and grader as `rl-env-selection`, but the agent is given a **callable OpenAI-compatible model gateway** so it can build an LLM-judge / multi-subagent **pipeline** in `solution.py` instead of only hand-written features. The seed ships `llm_client.py` (stdlib-only, runs inside the grader venv); `LLMClient.map(...)` fans out one "subagent" call per environment in parallel to rate learnability.
+
+- **Agents**: 4
+- **Timeout**: 600s
+- **Scoring**: **AUROC** of the score vs the keep/drop label (primary, returned); AP, mSR on `v=p(1-p)`, and Spearman reported as secondary. (Differs from `rl-env-selection`, which uses mSR on `v=1-p^8-(1-p)^8`.)
+- **Model**: configured via env vars the grader subprocess inherits from your `coral start` shell — `CORAL_LLM_BASE_URL`, `CORAL_LLM_API_KEY`, `CORAL_LLM_MODEL` (falls back to the standard `OPENAI_*` names). If unset, `solution.py` degrades to a cheap heuristic so the run still grades.
+- **Usage**:
+  ```bash
+  export CORAL_LLM_BASE_URL="http://<host>:<port>/v1"
+  export CORAL_LLM_API_KEY="<key>"
+  export CORAL_LLM_MODEL="openai/qwen3-32b"
+  coral start -c examples/rl-env-selection-agentic/task.yaml
+  ```
 
 ## Writing Your Own
 
